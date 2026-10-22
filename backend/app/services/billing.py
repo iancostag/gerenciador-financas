@@ -210,6 +210,53 @@ def compute_bill(
         closed_due = min(b.due_date for b in pluggy_bills)
         source = "PLUGGY"
 
+        # Auto-healing de rollover: compras de ciclo anterior que não foram incluídas
+        # na fatura fechada oficial publicada (ex: compra processada após o corte do banco)
+        # rolam automaticamente para a fatura aberta atual.
+        closed_bill_ids = [
+            b.pluggy_bill_id
+            for b in db.query(CreditCardBill)
+            .filter(CreditCardBill.account_id.in_(account_ids), CreditCardBill.pluggy_bill_id.isnot(None))
+            .all()
+        ]
+        rollover_debits = (
+            db.query(func.coalesce(func.sum(Transaction.amount), 0))
+            .filter(
+                Transaction.account_id.in_(account_ids),
+                Transaction.type == TransactionType.DEBIT,
+                Transaction.is_ignored == 0,
+                Transaction.date >= _utc(prev_closing),
+                Transaction.date < _utc(last_closing),
+                Transaction.bill_forecast_date.is_(None),
+                or_(
+                    Transaction.pluggy_bill_id.is_(None),
+                    Transaction.pluggy_bill_id.notin_(closed_bill_ids),
+                ),
+            )
+            .scalar()
+        )
+        rollover_credits = (
+            db.query(func.coalesce(func.sum(Transaction.amount), 0))
+            .filter(
+                Transaction.account_id.in_(account_ids),
+                Transaction.type == TransactionType.CREDIT,
+                Transaction.is_ignored == 0,
+                Transaction.date >= _utc(prev_closing),
+                Transaction.date < _utc(last_closing),
+                Transaction.bill_forecast_date.is_(None),
+                func.coalesce(Transaction.category, "") != BILL_PAYMENT_CATEGORY,
+                ~Transaction.description.ilike("%pagamento%"),
+                or_(
+                    Transaction.pluggy_bill_id.is_(None),
+                    Transaction.pluggy_bill_id.notin_(closed_bill_ids),
+                ),
+            )
+            .scalar()
+        )
+        rollover_net = float(rollover_debits or 0) - float(rollover_credits or 0)
+        if rollover_net > 0:
+            open_amount += rollover_net
+
     closed_remaining = closed_amount - payments
     if closed_remaining > PAID_TOLERANCE:
         return BillSnapshot(

@@ -186,6 +186,52 @@ class ComputeBillTest(unittest.TestCase):
         self.assertEqual(bill.open_amount, 1131.00)
         self.assertEqual(bill.open_due_date, date(2026, 11, 7))
 
+    def test_auto_healing_orphan_rollover(self):
+        # Fatura fechada oficial de Outubro cadastrada (1259.19)
+        self.db.add(
+            CreditCardBill(
+                account_id=self.card.id,
+                pluggy_bill_id="bill-october-closed",
+                due_date=date(2026, 10, 7),
+                total_amount=Decimal("1259.19"),
+                paid_amount=Decimal("1259.19"),
+            )
+        )
+        # Compra avulsa feita em 01/10 (antes do fechamento de 02/10),
+        # mas que NÃO foi incluída na fatura fechada oficial (pluggy_bill_id é None)
+        self.db.add(
+            Transaction(
+                account_id=self.card.id,
+                amount=Decimal("21.99"),
+                date=utc(2026, 10, 1, 4),
+                description="AMAZON BR",
+                category="Compras",
+                type=TransactionType.DEBIT,
+                pluggy_transaction_id="tx-amazon-orphan",
+                bill_forecast_date=None,
+                pluggy_bill_id=None,
+            )
+        )
+        # Compra no ciclo aberto de Novembro
+        self.db.add(
+            Transaction(
+                account_id=self.card.id,
+                amount=Decimal("100.00"),
+                date=utc(2026, 10, 15, 12),
+                description="Compra Normal Novembro",
+                category="Compras",
+                type=TransactionType.DEBIT,
+                pluggy_transaction_id="tx-normal-nov",
+                bill_forecast_date=None,
+            )
+        )
+        self.db.flush()
+
+        bill = compute_bill(self.db, [self.card.id], 2, 7, utc(2026, 10, 22, 12))
+        # O cálculo deve automaticamente resgatar a compra órfã da Amazon (21.99)
+        # e somar com a compra de novembro (100.00) = 121.99
+        self.assertEqual(bill.open_amount, 121.99)
+
 
 if __name__ == "__main__":
     unittest.main()
