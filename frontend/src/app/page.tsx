@@ -176,6 +176,7 @@ interface TransactionItem {
   type: "DEBIT" | "CREDIT";
   pluggy_transaction_id: string;
   pluggy_bill_id?: string | null;
+  bill_forecast_date?: string | null;
   installment_number?: number | null;
   total_installments?: number | null;
   is_ignored?: boolean;

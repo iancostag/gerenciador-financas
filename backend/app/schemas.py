@@ -31,6 +31,7 @@ class TransactionResponse(BaseModel):
     type: TransactionType
     pluggy_transaction_id: str
     pluggy_bill_id: Optional[str] = None
+    bill_forecast_date: Optional[str] = None
     installment_number: Optional[int] = None
     total_installments: Optional[int] = None
     is_ignored: bool = False

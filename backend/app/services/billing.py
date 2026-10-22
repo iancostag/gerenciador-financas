@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import List, Optional, Tuple
 
-from sqlalchemy import func
+from sqlalchemy import func, or_, and_
 from sqlalchemy.orm import Session
 
 from app.models import CreditCardBill, Transaction, TransactionType
@@ -42,6 +42,7 @@ class BillSnapshot:
     open_amount: float
     payments: float
     open_cycle_end: datetime  # BRT, próximo fechamento (para o orçamento diário)
+    open_due_date: Optional[date] = None
 
 
 def _closing_at(year: int, month: int, closing_day: int) -> datetime:
@@ -82,21 +83,41 @@ def _utc(dt: datetime) -> datetime:
 
 
 def _cycle_net(
-    db: Session, account_ids: List[int], start: datetime, end: datetime
+    db: Session,
+    account_ids: List[int],
+    start: datetime,
+    end: datetime,
+    forecast_month: Optional[str] = None,
 ) -> float:
     def total(tx_type: TransactionType, *extra) -> float:
-        value = (
-            db.query(func.coalesce(func.sum(Transaction.amount), 0))
-            .filter(
-                Transaction.account_id.in_(account_ids),
-                Transaction.type == tx_type,
+        query = db.query(func.coalesce(func.sum(Transaction.amount), 0)).filter(
+            Transaction.account_id.in_(account_ids),
+            Transaction.type == tx_type,
+            Transaction.is_ignored == 0,
+            *extra,
+        )
+        if forecast_month:
+            # Compatibilidade universal:
+            # 1. Se a compra tem bill_forecast_date informado pelo banco (Open Finance),
+            #    pertence à fatura oficial prevista pelo emissor do cartão.
+            # 2. Se bill_forecast_date for nulo (compras avulsas ou outros bancos),
+            #    usa a janela cronológica do ciclo [start, end).
+            query = query.filter(
+                or_(
+                    Transaction.bill_forecast_date == forecast_month,
+                    and_(
+                        Transaction.bill_forecast_date.is_(None),
+                        Transaction.date >= _utc(start),
+                        Transaction.date < _utc(end),
+                    ),
+                )
+            )
+        else:
+            query = query.filter(
                 Transaction.date >= _utc(start),
                 Transaction.date < _utc(end),
-                Transaction.is_ignored == 0,
-                *extra,
             )
-            .scalar()
-        )
+        value = query.scalar()
         return float(value or 0)
 
     debits = total(TransactionType.DEBIT)
@@ -162,19 +183,14 @@ def compute_bill(
             open_amount=0.0,
             payments=0.0,
             open_cycle_end=next_closing,
+            open_due_date=open_due,
         )
 
-    # Trava o ciclo aberto até o fim do dia atual em BRT (23:59:59.999999 BRT)
-    # para que parcelas futuras projetadas pelo banco (ex: lançadas para o fim do mês)
-    # não inflem a fatura aberta do mês atual
-    end_of_today_brt = datetime(
-        now_brt.year, now_brt.month, now_brt.day, 23, 59, 59, 999999, tzinfo=BRT
-    )
-    # Próximo dia útil pós-hoje para corte exclusivo
-    effective_open_end = min(next_closing, end_of_today_brt + timedelta(microseconds=1))
+    open_forecast = open_due.strftime("%Y-%m")
+    closed_forecast = closed_due.strftime("%Y-%m")
 
-    open_amount = max(0.0, _cycle_net(db, account_ids, last_closing, effective_open_end))
-    closed_amount = max(0.0, _cycle_net(db, account_ids, prev_closing, last_closing))
+    open_amount = max(0.0, _cycle_net(db, account_ids, last_closing, next_closing, open_forecast))
+    closed_amount = max(0.0, _cycle_net(db, account_ids, prev_closing, last_closing, closed_forecast))
     payments = _payments_since(db, account_ids, last_closing)
     source = "CALCULATED"
 
@@ -207,6 +223,7 @@ def compute_bill(
             open_amount=round(open_amount, 2),
             payments=round(payments, 2),
             open_cycle_end=next_closing,
+            open_due_date=open_due,
         )
 
     # Pagamento acima da fechada não abate a aberta: costuma ser fatura antiga paga
@@ -222,4 +239,5 @@ def compute_bill(
         open_amount=round(open_amount, 2),
         payments=round(payments, 2),
         open_cycle_end=next_closing,
+        open_due_date=open_due,
     )

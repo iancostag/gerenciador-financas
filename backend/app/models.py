@@ -88,6 +88,7 @@ class Transaction(Base):
     # creditCardMetadata (Pluggy): fatura a que a compra pertence e número de parcelas
     bill_id = Column(String(100), nullable=True, index=True)
     pluggy_bill_id = Column(String(100), nullable=True, index=True)
+    bill_forecast_date = Column(String(20), nullable=True, index=True)
     installment_number = Column(Integer, nullable=True)
     total_installments = Column(Integer, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())

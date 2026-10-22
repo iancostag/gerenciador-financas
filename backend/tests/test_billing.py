@@ -136,6 +136,56 @@ class ComputeBillTest(unittest.TestCase):
         self.assertEqual(bill.amount, 0.0)
         self.assertEqual(bill.status, "OPEN")
 
+    def test_forecast_date_universal_compatibility(self):
+        # Cartão fechamento dia 2, vencimento dia 7
+        # Em 22/10/2026: última fechada foi 02/10 (venceu 07/10), aberta atual fecha 02/11 (vence 07/11 -> forecast 2026-11)
+        # 1. Compra avulsa dentro do ciclo sem forecast_date (fallback cronológico)
+        self.db.add(
+            Transaction(
+                account_id=self.card.id,
+                amount=Decimal("914.53"),
+                date=utc(2026, 10, 15, 12),
+                description="Compras diversas avulsas",
+                category="Compras",
+                type=TransactionType.DEBIT,
+                pluggy_transaction_id="tx-avulsa",
+                bill_forecast_date=None,
+            )
+        )
+        # 2. Parcela programada para o fim do mês com bill_forecast_date == '2026-11'
+        self.db.add(
+            Transaction(
+                account_id=self.card.id,
+                amount=Decimal("216.47"),
+                date=utc(2026, 10, 28, 3),
+                description="Parcelas de Novembro",
+                category="Compras",
+                type=TransactionType.DEBIT,
+                pluggy_transaction_id="tx-parcela-nov",
+                bill_forecast_date="2026-11",
+            )
+        )
+        # 3. Parcela de ciclo futuro com bill_forecast_date == '2026-12'
+        self.db.add(
+            Transaction(
+                account_id=self.card.id,
+                amount=Decimal("160.90"),
+                date=utc(2026, 11, 27, 3),
+                description="Parcelas de Dezembro",
+                category="Compras",
+                type=TransactionType.DEBIT,
+                pluggy_transaction_id="tx-parcela-dez",
+                bill_forecast_date="2026-12",
+            )
+        )
+        self.db.flush()
+
+        bill = compute_bill(self.db, [self.card.id], 2, 7, utc(2026, 10, 22, 12))
+        # Total aberto deve somar a avulsa (914.53) + parcela nov (216.47) = 1131.00
+        # E NÃO deve incluir a parcela dez (160.90)
+        self.assertEqual(bill.open_amount, 1131.00)
+        self.assertEqual(bill.open_due_date, date(2026, 11, 7))
+
 
 if __name__ == "__main__":
     unittest.main()

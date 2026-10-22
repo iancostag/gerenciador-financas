@@ -285,6 +285,9 @@ class PluggyClient:
         tot_inst = cc_meta.get("totalInstallments")
         total_installments = int(tot_inst) if tot_inst is not None else None
 
+        raw_forecast = cc_meta.get("billForecastDate")
+        bill_forecast_date = str(raw_forecast).strip() if raw_forecast else None
+
         return {
             "account_id": local_account_id,
             "amount": raw_amount,
@@ -297,6 +300,7 @@ class PluggyClient:
             "pluggy_transaction_id": str(raw_tx["id"]),
             "bill_id": bill_id,
             "pluggy_bill_id": bill_id,
+            "bill_forecast_date": bill_forecast_date,
             "installment_number": installment_number,
             "total_installments": total_installments,
         }
@@ -412,6 +416,7 @@ class PluggyClient:
                             "type": tx_values["type"],
                             "bill_id": tx_values["bill_id"],
                             "pluggy_bill_id": tx_values["pluggy_bill_id"],
+                            "bill_forecast_date": tx_values["bill_forecast_date"],
                             "installment_number": tx_values["installment_number"],
                             "total_installments": tx_values["total_installments"],
                         },

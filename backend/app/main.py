@@ -11,7 +11,7 @@ from fastapi import FastAPI, Depends, HTTPException, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import func, inspect, or_, text
+from sqlalchemy import func, inspect, or_, and_, text
 from sqlalchemy.orm import Session
 from dotenv import load_dotenv
 
@@ -83,6 +83,7 @@ def ensure_new_columns():
         "transactions": {
             "bill_id": "VARCHAR(100)",
             "pluggy_bill_id": "VARCHAR(100)",
+            "bill_forecast_date": "VARCHAR(20)",
             "installment_number": "INTEGER",
             "total_installments": "INTEGER",
         },
@@ -90,6 +91,9 @@ def ensure_new_columns():
             "closing_date": "DATE",
             "paid_amount": "NUMERIC(14, 2) DEFAULT 0.00",
             "state": "VARCHAR(50)",
+        },
+        "app_settings": {
+            "updated_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
         },
     }
     inspector = inspect(engine)
@@ -313,11 +317,34 @@ def list_transactions(
 
     end_of_today_utc = get_end_of_today_utc()
 
-    # Filtro de período inteligente (separa compras ocorridas até hoje em BRT de parcelas futuras projetadas)
-    if period == "current_month":
-        query = query.filter(Transaction.date <= end_of_today_utc)
-    elif period == "future":
-        query = query.filter(Transaction.date > end_of_today_utc)
+    # Filtro de período inteligente:
+    # - "current_month": compras até hoje ou faturadas no ciclo aberto atual
+    # - "future": parcelas futuras projetadas para ciclos posteriores
+    if period in ("current_month", "future"):
+        open_forecast = get_open_bill_forecast(db)
+        if period == "current_month":
+            query = query.filter(
+                or_(
+                    and_(
+                        Transaction.bill_forecast_date.isnot(None),
+                        Transaction.bill_forecast_date <= open_forecast,
+                    ),
+                    and_(
+                        Transaction.bill_forecast_date.is_(None),
+                        Transaction.date <= end_of_today_utc,
+                    ),
+                )
+            )
+        elif period == "future":
+            query = query.filter(
+                or_(
+                    Transaction.bill_forecast_date > open_forecast,
+                    and_(
+                        Transaction.bill_forecast_date.is_(None),
+                        Transaction.date > end_of_today_utc,
+                    ),
+                )
+            )
 
     if isinstance(account_id, int):
         query = query.filter(Transaction.account_id == account_id)
@@ -361,6 +388,7 @@ def list_transactions(
             type=t.type,
             pluggy_transaction_id=t.pluggy_transaction_id,
             pluggy_bill_id=t.pluggy_bill_id,
+            bill_forecast_date=t.bill_forecast_date,
             installment_number=t.installment_number,
             total_installments=t.total_installments,
             is_ignored=bool(t.is_ignored),
@@ -410,6 +438,7 @@ def update_transaction(
         type=tx.type,
         pluggy_transaction_id=tx.pluggy_transaction_id,
         pluggy_bill_id=tx.pluggy_bill_id,
+        bill_forecast_date=tx.bill_forecast_date,
         installment_number=tx.installment_number,
         total_installments=tx.total_installments,
         is_ignored=bool(tx.is_ignored),
@@ -468,6 +497,20 @@ def resolve_card_bill(db: Session, settings_map: dict, now: datetime):
                 db.rollback()
 
     return snapshot, closing_day, due_day, custom_amount
+
+
+def get_open_bill_forecast(db: Session) -> str:
+    now = datetime.now(timezone.utc)
+    now_brt = now.astimezone(BRT)
+    default_forecast = now_brt.strftime("%Y-%m")
+    try:
+        settings_map = load_settings_map(db)
+        snapshot, _, _, _ = resolve_card_bill(db, settings_map, now)
+        if snapshot.open_due_date:
+            return snapshot.open_due_date.strftime("%Y-%m")
+    except Exception:
+        pass
+    return default_forecast
 
 
 @app.get("/api/v1/metrics", response_model=DashboardMetricsResponse)
@@ -568,13 +611,37 @@ def get_dashboard_metrics(
         for row in category_rows
     ]
 
-    # 4. Faturas / Compromissos futuros (parcelas do cartão com data posterior a hoje em BRT)
+    # Configurações de Cartão e Fatura Atual
+    settings_map = load_settings_map(db)
+    bill, card_closing_day, card_due_day, custom_bill_amount = resolve_card_bill(
+        db, settings_map, now
+    )
+    if custom_bill_amount is not None:
+        current_bill = custom_bill_amount
+        is_bill_custom = True
+    else:
+        current_bill = bill.amount
+        is_bill_custom = False
+
+    open_forecast = (
+        bill.open_due_date.strftime("%Y-%m")
+        if bill.open_due_date
+        else now_brt.strftime("%Y-%m")
+    )
+
+    # 4. Faturas / Compromissos futuros (parcelas do cartão com previsão posterior à fatura aberta)
     future_rows = (
         db.query(Transaction)
         .filter(
             Transaction.type == TransactionType.DEBIT,
-            Transaction.date > end_of_today_utc,
             Transaction.is_ignored == 0,
+            or_(
+                Transaction.bill_forecast_date > open_forecast,
+                and_(
+                    Transaction.bill_forecast_date.is_(None),
+                    Transaction.date > end_of_today_utc,
+                ),
+            ),
         )
         .order_by(Transaction.date.asc())
         .all()
@@ -589,20 +656,25 @@ def get_dashboard_metrics(
 
     future_by_month_dict = {}
     future_commitments_total = 0.0
-    curr_ym_brt = now_brt.strftime("%Y-%m")
 
     for f_tx in future_rows:
         amount_float = float(f_tx.amount)
         future_commitments_total += amount_float
-        tx_dt_brt = (
-            f_tx.date.astimezone(BRT)
-            if f_tx.date.tzinfo
-            else f_tx.date.replace(tzinfo=timezone.utc).astimezone(BRT)
-        )
-        m_key = tx_dt_brt.strftime("%Y-%m")
+        if f_tx.bill_forecast_date:
+            m_key = f_tx.bill_forecast_date
+            parts = m_key.split("-")
+            y_val, m_val = int(parts[0]), int(parts[1])
+            label = f"{month_names.get(m_val, '')}/{y_val}"
+        else:
+            tx_dt_brt = (
+                f_tx.date.astimezone(BRT)
+                if f_tx.date.tzinfo
+                else f_tx.date.replace(tzinfo=timezone.utc).astimezone(BRT)
+            )
+            m_key = tx_dt_brt.strftime("%Y-%m")
+            label = f"{month_names.get(tx_dt_brt.month, '')}/{tx_dt_brt.year}"
+
         if m_key not in future_by_month_dict:
-            base_label = f"{month_names.get(tx_dt_brt.month, '')}/{tx_dt_brt.year}"
-            label = f"Próx. Ciclo ({base_label})" if m_key == curr_ym_brt else base_label
             future_by_month_dict[m_key] = {"month": m_key, "label": label, "total": 0.0, "count": 0}
         future_by_month_dict[m_key]["total"] += amount_float
         future_by_month_dict[m_key]["count"] += 1
@@ -631,19 +703,8 @@ def get_dashboard_metrics(
         for acc in accounts_db
     ]
 
-    # 6. Configurações de Cartão e Projeção Dinâmica
-    settings_map = load_settings_map(db)
+    # 6. Salário do usuário e Projeção Dinâmica
     user_salary = float(settings_map.get("user_salary", 0.0) or 0.0)
-
-    bill, card_closing_day, card_due_day, custom_bill_amount = resolve_card_bill(
-        db, settings_map, now
-    )
-    if custom_bill_amount is not None:
-        current_bill = custom_bill_amount
-        is_bill_custom = True
-    else:
-        current_bill = bill.amount
-        is_bill_custom = False
 
     # 7. Contas Fixas / Recorrentes
     curr_ym = now_brt.strftime("%Y-%m")
