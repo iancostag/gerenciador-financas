@@ -74,6 +74,11 @@ class SalaryProjection(BaseModel):
     bill_due_day: int = 7
     bill_cycle_start: str = ""
     bill_cycle_end: str = ""
+    bill_status: str = "OPEN"  # CLOSED = fechada aguardando pagamento; OPEN = aberta
+    bill_source: str = "CALCULATED"  # PLUGGY = fatura oficial via /bills
+    bill_due_date: str = ""
+    bill_closed_amount: float = 0.0
+    bill_open_amount: float = 0.0
     total_available: float
     free_balance: float
     days_remaining: int = 30

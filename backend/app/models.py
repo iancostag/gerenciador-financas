@@ -1,6 +1,7 @@
 import enum
 from sqlalchemy import (
     Column,
+    Date,
     Integer,
     String,
     Numeric,
@@ -29,6 +30,9 @@ class Account(Base):
     balance = Column(Numeric(14, 2), nullable=False, default=0.00)
     currency = Column(String(10), nullable=False, default="BRL")
     pluggy_account_id = Column(String(100), unique=True, nullable=False, index=True)
+    # Datas reais do cartão vindas de creditData (Pluggy); nulas para contas BANK
+    bill_close_date = Column(Date, nullable=True)
+    bill_due_date = Column(Date, nullable=True)
     updated_at = Column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
@@ -54,12 +58,36 @@ class Transaction(Base):
     type = Column(Enum(TransactionType, name="transaction_type_enum"), nullable=False)
     pluggy_transaction_id = Column(String(100), unique=True, nullable=False, index=True)
     is_ignored = Column(Integer, default=0, nullable=False)
+    # creditCardMetadata (Pluggy): fatura a que a compra pertence e parcela
+    bill_id = Column(String(100), nullable=True, index=True)
+    installment_number = Column(Integer, nullable=True)
+    total_installments = Column(Integer, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     account = relationship("Account", back_populates="transactions")
 
     __table_args__ = (
         Index("ix_transactions_date_category", "date", "category"),
+    )
+
+
+class CreditCardBill(Base):
+    """Fatura fechada do cartão, como retornada por GET /bills da Pluggy."""
+
+    __tablename__ = "credit_card_bills"
+
+    id = Column(Integer, primary_key=True, index=True)
+    account_id = Column(
+        Integer, ForeignKey("accounts.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    pluggy_bill_id = Column(String(100), unique=True, nullable=False, index=True)
+    due_date = Column(Date, nullable=False, index=True)
+    closing_date = Column(Date, nullable=True)
+    total_amount = Column(Numeric(14, 2), nullable=False)
+    minimum_payment_amount = Column(Numeric(14, 2), nullable=True)
+    paid_amount = Column(Numeric(14, 2), nullable=False, default=0.00)
+    updated_at = Column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
 
 

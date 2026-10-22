@@ -1,7 +1,7 @@
 import os
 import logging
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
 import requests
@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-from app.models import Account, Transaction, TransactionType
+from app.models import Account, CreditCardBill, Transaction, TransactionType
 
 logger = logging.getLogger(__name__)
 ROOT_ENV = Path(__file__).resolve().parents[3] / ".env"
@@ -22,6 +22,16 @@ def dialect_insert(db: Session, model):
     if dialect_name == "sqlite":
         return sqlite_insert(model)
     return pg_insert(model)
+
+
+def parse_pluggy_date(raw: Optional[str]) -> Optional[date]:
+    """Datas de calendário da Pluggy (vencimento, fechamento) vêm como ISO; usa só o dia."""
+    if not raw:
+        return None
+    try:
+        return date.fromisoformat(str(raw)[:10])
+    except ValueError:
+        return None
 
 
 class PluggyClientError(Exception):
@@ -217,6 +227,32 @@ class PluggyClient:
 
         return all_transactions
 
+    def fetch_bills(self, pluggy_account_id: str) -> List[Dict[str, Any]]:
+        """
+        Busca as faturas fechadas do cartão em GET /bills?accountId={id}.
+        Nem todo conector/plano expõe faturas: em caso de erro retorna lista vazia
+        e o cálculo da fatura cai para a soma das transações.
+        """
+        try:
+            resp = requests.get(
+                f"{self.BASE_URL}/bills",
+                headers=self.headers,
+                params={"accountId": pluggy_account_id, "pageSize": 500},
+                timeout=25,
+            )
+        except requests.RequestException as exc:
+            logger.warning("Falha ao buscar faturas da conta %s: %s", pluggy_account_id, exc)
+            return []
+        if resp.status_code != 200:
+            logger.warning(
+                "Faturas indisponíveis para a conta %s (%s): %s",
+                pluggy_account_id,
+                resp.status_code,
+                resp.text,
+            )
+            return []
+        return resp.json().get("results", [])
+
     @staticmethod
     def _parse_transaction_json(
         raw_tx: Dict[str, Any], local_account_id: int
@@ -236,6 +272,7 @@ class PluggyClient:
         )
         merchant_cnpj = merchant.get("cnpj")
         category = raw_tx.get("category") or "Outros"
+        card_meta = raw_tx.get("creditCardMetadata") or {}
 
         raw_type = (raw_tx.get("type") or "DEBIT").upper()
         tx_type = (
@@ -262,7 +299,43 @@ class PluggyClient:
             "category": category,
             "type": tx_type,
             "pluggy_transaction_id": str(raw_tx["id"]),
+            "bill_id": card_meta.get("billId"),
+            "installment_number": card_meta.get("installmentNumber"),
+            "total_installments": card_meta.get("totalInstallments"),
         }
+
+    def _upsert_bills(self, db: Session, pluggy_acc_id: str, local_account_id: int) -> None:
+        for raw_bill in self.fetch_bills(pluggy_acc_id):
+            due_date = parse_pluggy_date(raw_bill.get("dueDate"))
+            if not raw_bill.get("id") or due_date is None:
+                continue
+            paid = sum(
+                abs(Decimal(str(p.get("amount") or 0)))
+                for p in raw_bill.get("payments") or []
+            )
+            min_payment = raw_bill.get("minimumPaymentAmount")
+            bill_values = {
+                "account_id": local_account_id,
+                "pluggy_bill_id": str(raw_bill["id"]),
+                "due_date": due_date,
+                "closing_date": parse_pluggy_date(raw_bill.get("billClosingDate")),
+                "total_amount": Decimal(str(raw_bill.get("totalAmount") or 0)),
+                "minimum_payment_amount": (
+                    Decimal(str(min_payment)) if min_payment is not None else None
+                ),
+                "paid_amount": paid,
+            }
+            stmt = (
+                dialect_insert(db, CreditCardBill)
+                .values(**bill_values)
+                .on_conflict_do_update(
+                    index_elements=[CreditCardBill.pluggy_bill_id],
+                    set_={
+                        k: v for k, v in bill_values.items() if k != "pluggy_bill_id"
+                    },
+                )
+            )
+            db.execute(stmt)
 
     def sync_to_database(
         self,
@@ -283,12 +356,15 @@ class PluggyClient:
 
         for raw_acc in raw_accounts:
             pluggy_acc_id = str(raw_acc["id"])
+            credit_data = raw_acc.get("creditData") or {}
             acc_values = {
                 "name": raw_acc.get("name") or "Conta Pluggy",
                 "type": raw_acc.get("type") or "BANK",
                 "balance": Decimal(str(raw_acc.get("balance", 0.0))),
                 "currency": raw_acc.get("currencyCode") or "BRL",
                 "pluggy_account_id": pluggy_acc_id,
+                "bill_close_date": parse_pluggy_date(credit_data.get("balanceCloseDate")),
+                "bill_due_date": parse_pluggy_date(credit_data.get("balanceDueDate")),
             }
 
             acc_stmt = (
@@ -301,12 +377,17 @@ class PluggyClient:
                         "type": acc_values["type"],
                         "balance": acc_values["balance"],
                         "currency": acc_values["currency"],
+                        "bill_close_date": acc_values["bill_close_date"],
+                        "bill_due_date": acc_values["bill_due_date"],
                     },
                 )
                 .returning(Account.id)
             )
             local_account_id = db.execute(acc_stmt).scalar_one()
             accounts_synced += 1
+
+            if acc_values["type"] == "CREDIT":
+                self._upsert_bills(db, pluggy_acc_id, local_account_id)
 
             raw_transactions = self.fetch_transactions(
                 pluggy_account_id=pluggy_acc_id, date_from=date_from
@@ -328,6 +409,9 @@ class PluggyClient:
                             "merchant_cnpj": tx_values["merchant_cnpj"],
                             "category": tx_values["category"],
                             "type": tx_values["type"],
+                            "bill_id": tx_values["bill_id"],
+                            "installment_number": tx_values["installment_number"],
+                            "total_installments": tx_values["total_installments"],
                         },
                     )
                 )

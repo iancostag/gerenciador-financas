@@ -94,6 +94,11 @@ interface SalaryProjection {
   bill_due_day: number;
   bill_cycle_start: string;
   bill_cycle_end: string;
+  bill_status?: "OPEN" | "CLOSED";
+  bill_source?: "PLUGGY" | "CALCULATED";
+  bill_due_date?: string;
+  bill_closed_amount?: number;
+  bill_open_amount?: number;
   total_available: number;
   free_balance: number;
   days_remaining?: number;
@@ -1596,10 +1601,16 @@ export default function DashboardPage() {
                     <div className="flex items-center gap-3.5">
                       <div className="h-11 w-11 rounded-xl bg-amber-50 border border-amber-200/70 flex flex-col items-center justify-center shrink-0">
                         <span className="text-xs font-extrabold text-amber-800 leading-none">
-                          {String(proj.bill_due_day).padStart(2, "0")}
+                          {proj.bill_due_date
+                            ? proj.bill_due_date.slice(0, 2)
+                            : String(proj.bill_due_day).padStart(2, "0")}
                         </span>
                         <span className="text-[9px] font-bold uppercase text-amber-600 mt-0.5">
-                          {currentMonthShort}
+                          {proj.bill_due_date
+                            ? new Date(2000, Number(proj.bill_due_date.slice(3, 5)) - 1, 1)
+                                .toLocaleDateString("pt-BR", { month: "short" })
+                                .replace(".", "")
+                            : currentMonthShort}
                         </span>
                       </div>
                       <div>
@@ -1607,8 +1618,8 @@ export default function DashboardPage() {
                           Fatura Cartão {creditAccountName}
                         </p>
                         <p className="text-[11px] text-slate-400 mt-0.5">
-                          Cartão de crédito • Fecha dia{" "}
-                          {String(proj.bill_closing_day).padStart(2, "0")}
+                          {proj.bill_status === "CLOSED" ? "Fatura fechada" : "Fatura aberta"} •
+                          Compras de {proj.bill_cycle_start} a {proj.bill_cycle_end}
                         </p>
                       </div>
                     </div>
@@ -2259,7 +2270,11 @@ export default function DashboardPage() {
                           : "bg-slate-100 text-slate-600"
                       }`}
                     >
-                      {proj?.is_bill_custom ? "Manual" : "Ciclo atual"}
+                      {proj?.is_bill_custom
+                        ? "Manual"
+                        : proj?.bill_status === "CLOSED"
+                        ? "Fechada"
+                        : "Ciclo atual"}
                     </span>
                     <button
                       onClick={(e) => {
@@ -2286,7 +2301,7 @@ export default function DashboardPage() {
                         : "text-slate-500"
                     }`}
                   >
-                    Fatura Aberta ({creditAccountName})
+                    {proj?.bill_status === "CLOSED" ? "Fatura Fechada" : "Fatura Aberta"} ({creditAccountName})
                   </p>
                   <p
                     className={`text-xl font-black tracking-tight tabular-nums mt-0.5 ${
@@ -2306,7 +2321,14 @@ export default function DashboardPage() {
                       : "border-slate-100 text-slate-400"
                   }`}
                 >
-                  <span>Fecha dia {proj?.bill_closing_day ?? 2} • Vence dia {proj?.bill_due_day ?? 7}</span>
+                  <span>
+                    {proj?.bill_due_date
+                      ? `Vence ${proj.bill_due_date}`
+                      : `Vence dia ${proj?.bill_due_day ?? 7}`}
+                    {proj?.bill_status === "CLOSED" && proj?.bill_open_amount
+                      ? ` • Aberta: ${formatCurrency(proj.bill_open_amount)}`
+                      : ` • Fecha dia ${proj?.bill_closing_day ?? 2}`}
+                  </span>
                   <span className="font-semibold text-indigo-500 group-hover:translate-x-0.5 transition">
                     {selectedAccountId === creditAccount?.id && period === "current_month" ? "Filtrado ✓" : "Filtrar cartão →"}
                   </span>

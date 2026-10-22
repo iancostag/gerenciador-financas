@@ -1,17 +1,16 @@
-import calendar
 import math
 import os
 import sys
 import requests
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import FastAPI, Depends, HTTPException, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import func, text
+from sqlalchemy import func, inspect, text
 from sqlalchemy.orm import Session
 from dotenv import load_dotenv
 
@@ -25,6 +24,7 @@ from app.models import (
     Caixinha,
     AppSetting,
 )
+from app.services.billing import BillSnapshot, compute_bill
 from app.schemas import (
     AccountResponse,
     AppSettingsResponse,
@@ -65,6 +65,28 @@ with engine.begin() as conn:
             ")"
         )
     )
+
+
+def ensure_new_columns():
+    """create_all não altera tabelas existentes: adiciona colunas novas em bancos antigos."""
+    wanted = {
+        "accounts": {"bill_close_date": "DATE", "bill_due_date": "DATE"},
+        "transactions": {
+            "bill_id": "VARCHAR(100)",
+            "installment_number": "INTEGER",
+            "total_installments": "INTEGER",
+        },
+    }
+    inspector = inspect(engine)
+    with engine.begin() as conn:
+        for table, columns in wanted.items():
+            existing = {c["name"] for c in inspector.get_columns(table)}
+            for name, ddl in columns.items():
+                if name not in existing:
+                    conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}"))
+
+
+ensure_new_columns()
 
 app = FastAPI(
     title="Personal Finance Manager API",
@@ -343,39 +365,54 @@ def update_transaction(
     )
 
 
-def get_credit_cycle_dates(closing_day: int, ref_date: Optional[datetime] = None):
+def load_settings_map(db: Session) -> dict:
+    try:
+        rows = db.execute(text("SELECT key, value FROM app_settings")).fetchall()
+        return {row[0]: row[1] for row in rows}
+    except Exception:
+        return {}
+
+
+def _to_float(raw: Optional[str]) -> Optional[float]:
+    try:
+        return float(raw) if raw not in (None, "") else None
+    except ValueError:
+        return None
+
+
+def resolve_card_bill(db: Session, settings_map: dict, now: datetime):
     """
-    Calcula as datas de início e fim do ciclo de fatura atual com base no dia de fechamento.
-    Ex: closing_day = 2.
-    Em 20/10/2026:
-      - início do ciclo: 02/10/2026 04:00:00 (após o fechamento anterior)
-      - fim do ciclo: 02/11/2026 23:59:59 (fechamento atual)
+    Calcula a fatura a pagar e aplica o valor manual, se houver.
+    Retorna (snapshot, closing_day, due_day, custom_amount ou None).
+
+    Dias de fechamento/vencimento: os informados pelo banco (creditData da Pluggy)
+    têm prioridade; os configurados manualmente valem só sem esse dado.
+    O valor manual vale apenas para a fatura em que foi salvo (custom_bill_cycle
+    = vencimento dela); quando a fatura muda, volta ao cálculo automático.
     """
-    if not ref_date:
-        ref_date = datetime.now(timezone.utc)
+    credit_accounts = db.query(Account).filter(Account.type == "CREDIT").all()
+    closing_day = int(settings_map.get("card_closing_day", 2) or 2)
+    due_day = int(settings_map.get("card_due_day", 7) or 7)
+    bank_close = next((a.bill_close_date for a in credit_accounts if a.bill_close_date), None)
+    bank_due = next((a.bill_due_date for a in credit_accounts if a.bill_due_date), None)
+    if bank_close:
+        closing_day = bank_close.day
+    if bank_due:
+        due_day = bank_due.day
 
-    year = ref_date.year
-    month = ref_date.month
-    day = ref_date.day
+    snapshot = compute_bill(
+        db, [a.id for a in credit_accounts], closing_day, due_day, now
+    )
 
-    def safe_date(y, m, d, hour=23, minute=59, second=59):
-        max_d = calendar.monthrange(y, m)[1]
-        return datetime(y, m, min(d, max_d), hour, minute, second, tzinfo=timezone.utc)
+    custom_amount = _to_float(settings_map.get("custom_bill_amount"))
+    if (
+        custom_amount is None
+        or custom_amount <= 0
+        or settings_map.get("custom_bill_cycle") != snapshot.due_date.isoformat()
+    ):
+        custom_amount = None
 
-    if day >= closing_day:
-        last_closing = safe_date(year, month, closing_day, 4, 0, 0)
-        if month == 12:
-            next_closing = safe_date(year + 1, 1, closing_day, 23, 59, 59)
-        else:
-            next_closing = safe_date(year, month + 1, closing_day, 23, 59, 59)
-    else:
-        next_closing = safe_date(year, month, closing_day, 23, 59, 59)
-        if month == 1:
-            last_closing = safe_date(year - 1, 12, closing_day, 4, 0, 0)
-        else:
-            last_closing = safe_date(year, month - 1, closing_day, 4, 0, 0)
-
-    return last_closing, next_closing
+    return snapshot, closing_day, due_day, custom_amount
 
 
 @app.get("/api/v1/metrics", response_model=DashboardMetricsResponse)
@@ -529,64 +566,17 @@ def get_dashboard_metrics(
     ]
 
     # 6. Configurações de Cartão e Projeção Dinâmica
-    try:
-        settings_rows = db.execute(text("SELECT key, value FROM app_settings")).fetchall()
-        settings_map = {row[0]: row[1] for row in settings_rows}
-    except Exception:
-        settings_map = {}
-
+    settings_map = load_settings_map(db)
     user_salary = float(settings_map.get("user_salary", 0.0) or 0.0)
-    card_closing_day = int(settings_map.get("card_closing_day", 2) or 2)
-    card_due_day = int(settings_map.get("card_due_day", 7) or 7)
-    custom_bill_str = settings_map.get("custom_bill_amount")
-    custom_bill_amount = float(custom_bill_str) if custom_bill_str and float(custom_bill_str) > 0 else None
 
-    # Ciclo da fatura
-    last_closing, next_closing = get_credit_cycle_dates(card_closing_day, now)
-
-    # Busca transações de cartão no ciclo
-    credit_account_ids = [acc.id for acc in accounts_db if acc.type == "CREDIT"]
-    dynamic_bill = 0.0
-    if credit_account_ids:
-        # Débitos do ciclo
-        cycle_debits = (
-            db.query(func.coalesce(func.sum(Transaction.amount), 0))
-            .filter(
-                Transaction.account_id.in_(credit_account_ids),
-                Transaction.type == TransactionType.DEBIT,
-                Transaction.date > last_closing,
-                Transaction.date <= next_closing,
-                Transaction.is_ignored == 0,
-            )
-            .scalar()
-            or 0
-        )
-        # Créditos/estornos do ciclo (excluindo pagamentos de fatura)
-        cycle_credits = (
-            db.query(func.coalesce(func.sum(Transaction.amount), 0))
-            .filter(
-                Transaction.account_id.in_(credit_account_ids),
-                Transaction.type == TransactionType.CREDIT,
-                Transaction.date > last_closing,
-                Transaction.date <= next_closing,
-                Transaction.is_ignored == 0,
-                ~Transaction.description.ilike("%pagamento%"),
-            )
-            .scalar()
-            or 0
-        )
-        dynamic_bill = max(0.0, float(cycle_debits) - float(cycle_credits))
-
+    bill, card_closing_day, card_due_day, custom_bill_amount = resolve_card_bill(
+        db, settings_map, now
+    )
     if custom_bill_amount is not None:
         current_bill = custom_bill_amount
         is_bill_custom = True
     else:
-        if dynamic_bill > 0:
-            current_bill = dynamic_bill
-        elif credit_float > 0:
-            current_bill = credit_float
-        else:
-            current_bill = 0.0
+        current_bill = bill.amount
         is_bill_custom = False
 
     # 7. Contas Fixas / Recorrentes
@@ -625,7 +615,7 @@ def get_dashboard_metrics(
     else:
         commitment_pct = 100.0
 
-    days_remaining = max(1, (next_closing.date() - now.date()).days)
+    days_remaining = max(1, (bill.open_cycle_end.date() - now.date()).days)
     daily_budget = max(0.0, free_balance / float(days_remaining))
 
     if free_balance <= 0:
@@ -647,8 +637,14 @@ def get_dashboard_metrics(
         is_bill_custom=is_bill_custom,
         bill_closing_day=card_closing_day,
         bill_due_day=card_due_day,
-        bill_cycle_start=last_closing.strftime("%d/%m"),
-        bill_cycle_end=next_closing.strftime("%d/%m"),
+        bill_cycle_start=bill.cycle_start.strftime("%d/%m"),
+        # Último dia de compras do ciclo (o fechamento é exclusivo)
+        bill_cycle_end=(bill.cycle_end - timedelta(days=1)).strftime("%d/%m"),
+        bill_status=bill.status,
+        bill_source=bill.source,
+        bill_due_date=bill.due_date.strftime("%d/%m"),
+        bill_closed_amount=bill.closed_amount,
+        bill_open_amount=bill.open_amount,
         total_available=round(total_available, 2),
         free_balance=round(free_balance, 2),
         days_remaining=days_remaining,
@@ -696,17 +692,10 @@ def update_salary(payload: SalaryUpdateRequest, db: Session = Depends(get_db)):
 @app.get("/api/v1/settings/card", response_model=CardSettings)
 def get_card_settings(db: Session = Depends(get_db)):
     """Retorna as configurações do cartão (dia de fechamento, vencimento e fatura customizada)."""
-    try:
-        rows = db.execute(text("SELECT key, value FROM app_settings")).fetchall()
-        settings_map = {row[0]: row[1] for row in rows}
-    except Exception:
-        settings_map = {}
-
-    closing_day = int(settings_map.get("card_closing_day", 2) or 2)
-    due_day = int(settings_map.get("card_due_day", 7) or 7)
-    custom_bill_str = settings_map.get("custom_bill_amount")
-    custom_bill = float(custom_bill_str) if custom_bill_str and float(custom_bill_str) > 0 else None
-
+    settings_map = load_settings_map(db)
+    _, closing_day, due_day, custom_bill = resolve_card_bill(
+        db, settings_map, datetime.now(timezone.utc)
+    )
     return CardSettings(
         closing_day=closing_day,
         due_day=due_day,
@@ -745,13 +734,21 @@ def update_card_settings(payload: CardSettingsUpdateRequest, db: Session = Depen
             )
         elif payload.custom_bill_amount is not None:
             c_amount = max(0.0, float(payload.custom_bill_amount))
-            db.execute(
-                text(
-                    "INSERT INTO app_settings (key, value) VALUES ('custom_bill_amount', :val) "
-                    "ON CONFLICT(key) DO UPDATE SET value = :val"
-                ),
-                {"val": str(c_amount)},
+            # Amarra o valor manual à fatura atual (calculada já com os dias salvos acima)
+            bill, _, _, _ = resolve_card_bill(
+                db, load_settings_map(db), datetime.now(timezone.utc)
             )
+            for key, val in (
+                ("custom_bill_amount", str(c_amount)),
+                ("custom_bill_cycle", bill.due_date.isoformat()),
+            ):
+                db.execute(
+                    text(
+                        "INSERT INTO app_settings (key, value) VALUES (:key, :val) "
+                        "ON CONFLICT(key) DO UPDATE SET value = :val"
+                    ),
+                    {"key": key, "val": val},
+                )
         db.commit()
     except Exception as e:
         db.rollback()
