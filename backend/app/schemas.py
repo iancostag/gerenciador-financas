@@ -30,6 +30,9 @@ class TransactionResponse(BaseModel):
     category: Optional[str] = None
     type: TransactionType
     pluggy_transaction_id: str
+    pluggy_bill_id: Optional[str] = None
+    installment_number: Optional[int] = None
+    total_installments: Optional[int] = None
     is_ignored: bool = False
 
     model_config = ConfigDict(from_attributes=True)
@@ -65,6 +68,9 @@ class SalaryProjection(BaseModel):
     bank_balance: float
     credit_balance: float
     current_bill: float
+    closed_bill: float = 0.0
+    open_bill: float = 0.0
+    active_bill_type: str = "OPEN"  # "CLOSED", "OPEN", "CUSTOM"
     recurring_bills_total: float = 0.0
     recurring_bills_pending: float = 0.0
     caixinhas_liquid_total: float = 0.0

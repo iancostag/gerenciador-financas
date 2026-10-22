@@ -4,20 +4,21 @@ import os
 import sys
 import requests
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 from fastapi import FastAPI, Depends, HTTPException, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import func, text
+from sqlalchemy import func, or_, text
 from sqlalchemy.orm import Session
 from dotenv import load_dotenv
 
 from app.database import Base, engine, get_db
 from app.models import (
     Account,
+    CreditCardBill,
     Transaction,
     TransactionType,
     RecurringBill,
@@ -53,18 +54,40 @@ from app.schemas import (
 )
 from app.services.pluggy_client import PluggyClient, PluggyClientError
 
+BRT = timezone(timedelta(hours=-3))
+
 # Cria as tabelas automaticamente na inicialização
 Base.metadata.create_all(bind=engine)
-with engine.begin() as conn:
-    conn.execute(
-        text(
-            "CREATE TABLE IF NOT EXISTS app_settings ("
-            "key VARCHAR(100) PRIMARY KEY, "
-            "value TEXT, "
-            "updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
-            ")"
+
+
+def _run_safe_migrations():
+    """Garante que bancos SQLite/PostgreSQL existentes recebam as novas colunas sem perda de dados."""
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "CREATE TABLE IF NOT EXISTS app_settings ("
+                "key VARCHAR(100) PRIMARY KEY, "
+                "value TEXT, "
+                "updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+                ")"
+            )
         )
-    )
+    migration_statements = [
+        "ALTER TABLE accounts ADD COLUMN balance_close_date TIMESTAMP",
+        "ALTER TABLE accounts ADD COLUMN balance_due_date TIMESTAMP",
+        "ALTER TABLE transactions ADD COLUMN pluggy_bill_id VARCHAR(100)",
+        "ALTER TABLE transactions ADD COLUMN installment_number INTEGER",
+        "ALTER TABLE transactions ADD COLUMN total_installments INTEGER",
+    ]
+    for stmt in migration_statements:
+        try:
+            with engine.begin() as conn:
+                conn.execute(text(stmt))
+        except Exception:
+            pass
+
+
+_run_safe_migrations()
 
 app = FastAPI(
     title="Personal Finance Manager API",
@@ -94,10 +117,13 @@ def sanitize_financial_ledger(db: Session):
        - No cartão (CREDIT): 'Pagamento recebido', etc.
        Ambos devem ter is_ignored = 1 e category = 'Pagamento de Fatura',
        pois o gasto real já foi contabilizado compra a compra no cartão.
-    2. Movimentações internas de caixinha / reserva:
+    2. Créditos contábeis internos de rolagem/parcelamento de dívida no cartão:
+       - 'Crédito de atraso', 'Encerramento de dívida', 'Parcelamento de fatura', 'Financiamento de fatura'
+       Devem ter is_ignored = 1 para não abaterem compras reais da fatura como se fossem estornos.
+    3. Movimentações internas de caixinha / reserva:
        - 'Dinheiro reservado...', 'Dinheiro retirado...'
        Devem ter is_ignored = 1 e category = 'Transferência / Reserva'.
-    3. Aplicações e Resgates de Investimentos / Poupança:
+    4. Aplicações e Resgates de Investimentos / Poupança:
        - 'Aplicação CDB%', 'Resgate CDB%', 'Aplicação RDB%', 'Resgate RDB%', etc.
        Devem ter is_ignored = 1 e category = 'Investimento / Transferência'.
     """
@@ -113,6 +139,22 @@ def sanitize_financial_ledger(db: Session):
                 "   OR LOWER(description) LIKE '%pagamento de cartao%' "
                 "   OR LOWER(description) LIKE '%pagamento de cartão%' "
                 ") AND (is_ignored = 0 OR category != 'Pagamento de Fatura')"
+            )
+        )
+        # Rolagem / Financiamento interno de fatura no cartão (não são estornos de lojistas)
+        db.execute(
+            text(
+                "UPDATE transactions SET is_ignored = 1, category = 'Encargos / Rolagem de Fatura' "
+                "WHERE type = 'CREDIT' AND ("
+                "   LOWER(description) LIKE '%crédito de atraso%' "
+                "   OR LOWER(description) LIKE '%credito de atraso%' "
+                "   OR LOWER(description) LIKE '%encerramento de dívida%' "
+                "   OR LOWER(description) LIKE '%encerramento de divida%' "
+                "   OR LOWER(description) LIKE '%parcelamento de fatura%' "
+                "   OR LOWER(description) LIKE '%financiamento de fatura%' "
+                "   OR LOWER(description) LIKE '%crédito rotativo%' "
+                "   OR LOWER(description) LIKE '%credito rotativo%' "
+                ") AND (is_ignored = 0 OR category != 'Encargos / Rolagem de Fatura')"
             )
         )
         # Caixinhas / Reservas
@@ -221,6 +263,21 @@ def get_categories(db: Session = Depends(get_db)):
     return {"categories": all_cats}
 
 
+def get_end_of_today_utc(ref_date: Optional[datetime] = None) -> datetime:
+    """Retorna 23:59:59.999999 do dia atual no fuso de Brasília (BRT), convertido para UTC."""
+    now_brt = (ref_date or datetime.now(timezone.utc)).astimezone(BRT)
+    return datetime(
+        now_brt.year,
+        now_brt.month,
+        now_brt.day,
+        23,
+        59,
+        59,
+        999999,
+        tzinfo=BRT,
+    ).astimezone(timezone.utc)
+
+
 @app.get("/api/v1/transactions", response_model=PaginatedTransactionsResponse)
 def list_transactions(
     page: int = Query(1, ge=1, description="Número da página"),
@@ -236,21 +293,13 @@ def list_transactions(
     """Listagem paginada das transações com filtros avançados."""
     query = db.query(Transaction)
 
-    now = datetime.now(timezone.utc)
-    target_year = now.year
-    target_month = now.month
-    if target_month == 12:
-        start_of_next_month = datetime(target_year + 1, 1, 1, tzinfo=timezone.utc)
-    else:
-        start_of_next_month = datetime(target_year, target_month + 1, 1, tzinfo=timezone.utc)
+    end_of_today_utc = get_end_of_today_utc()
 
-    # Filtro de período inteligente
+    # Filtro de período inteligente (separa compras ocorridas até hoje em BRT de parcelas futuras projetadas)
     if period == "current_month":
-        # Não traz parcelas futuras no extrato principal
-        query = query.filter(Transaction.date < start_of_next_month)
+        query = query.filter(Transaction.date <= end_of_today_utc)
     elif period == "future":
-        # Apenas parcelas dos próximos meses
-        query = query.filter(Transaction.date >= start_of_next_month)
+        query = query.filter(Transaction.date > end_of_today_utc)
 
     if isinstance(account_id, int):
         query = query.filter(Transaction.account_id == account_id)
@@ -293,6 +342,9 @@ def list_transactions(
             category=t.category,
             type=t.type,
             pluggy_transaction_id=t.pluggy_transaction_id,
+            pluggy_bill_id=t.pluggy_bill_id,
+            installment_number=t.installment_number,
+            total_installments=t.total_installments,
             is_ignored=bool(t.is_ignored),
         )
         for t in tx_rows
@@ -339,43 +391,54 @@ def update_transaction(
         category=tx.category,
         type=tx.type,
         pluggy_transaction_id=tx.pluggy_transaction_id,
+        pluggy_bill_id=tx.pluggy_bill_id,
+        installment_number=tx.installment_number,
+        total_installments=tx.total_installments,
         is_ignored=bool(tx.is_ignored),
     )
 
 
+def _safe_brt_midnight_utc(year: int, month: int, day: int) -> datetime:
+    """Retorna 00:00:00 BRT (03:00:00 UTC) para a data informada, respeitando o último dia do mês."""
+    max_d = calendar.monthrange(year, month)[1]
+    return datetime(year, month, min(day, max_d), 0, 0, 0, tzinfo=BRT).astimezone(timezone.utc)
+
+
+def _shift_year_month(year: int, month: int, delta_months: int) -> tuple[int, int]:
+    total_months = (year * 12 + (month - 1)) + delta_months
+    return total_months // 12, (total_months % 12) + 1
+
+
 def get_credit_cycle_dates(closing_day: int, ref_date: Optional[datetime] = None):
     """
-    Calcula as datas de início e fim do ciclo de fatura atual com base no dia de fechamento.
-    Ex: closing_day = 2.
-    Em 20/10/2026:
-      - início do ciclo: 02/10/2026 04:00:00 (após o fechamento anterior)
-      - fim do ciclo: 02/11/2026 23:59:59 (fechamento atual)
+    Calcula as datas de início e fim do ciclo de fatura aberto e do ciclo fechado anterior
+    no fuso horário de Brasília (BRT, UTC-3), usando intervalos semi-abertos [start, end)
+    sem sobreposição de horas:
+    - Transações que a Pluggy grava em 00:00:00 BRT (03:00:00Z) no dia de fechamento pertencem
+      ao novo ciclo que se inicia naquele dia.
     """
-    if not ref_date:
-        ref_date = datetime.now(timezone.utc)
-
-    year = ref_date.year
-    month = ref_date.month
-    day = ref_date.day
-
-    def safe_date(y, m, d, hour=23, minute=59, second=59):
-        max_d = calendar.monthrange(y, m)[1]
-        return datetime(y, m, min(d, max_d), hour, minute, second, tzinfo=timezone.utc)
+    ref_brt = (ref_date or datetime.now(timezone.utc)).astimezone(BRT)
+    year = ref_brt.year
+    month = ref_brt.month
+    day = ref_brt.day
 
     if day >= closing_day:
-        last_closing = safe_date(year, month, closing_day, 4, 0, 0)
-        if month == 12:
-            next_closing = safe_date(year + 1, 1, closing_day, 23, 59, 59)
-        else:
-            next_closing = safe_date(year, month + 1, closing_day, 23, 59, 59)
+        last_closing = _safe_brt_midnight_utc(year, month, closing_day)
+        next_y, next_m = _shift_year_month(year, month, 1)
+        next_closing = _safe_brt_midnight_utc(next_y, next_m, closing_day)
     else:
-        next_closing = safe_date(year, month, closing_day, 23, 59, 59)
-        if month == 1:
-            last_closing = safe_date(year - 1, 12, closing_day, 4, 0, 0)
-        else:
-            last_closing = safe_date(year, month - 1, closing_day, 4, 0, 0)
+        next_closing = _safe_brt_midnight_utc(year, month, closing_day)
+        prev_y, prev_m = _shift_year_month(year, month, -1)
+        last_closing = _safe_brt_midnight_utc(prev_y, prev_m, closing_day)
 
     return last_closing, next_closing
+
+
+def get_previous_closing_date(last_closing: datetime, closing_day: int) -> datetime:
+    """Retorna a data de início do ciclo anterior (fatura fechada) [prev_closing, last_closing)."""
+    last_brt = last_closing.astimezone(BRT)
+    prev_y, prev_m = _shift_year_month(last_brt.year, last_brt.month, -1)
+    return _safe_brt_midnight_utc(prev_y, prev_m, closing_day)
 
 
 @app.get("/api/v1/metrics", response_model=DashboardMetricsResponse)
@@ -387,9 +450,9 @@ def get_dashboard_metrics(
     """
     Retorna métricas financeiras reais e segregadas:
     - Saldo em contas correntes / poupança (dinheiro disponível)
-    - Fatura do cartão de crédito (compromisso / fatura)
+    - Fatura do cartão de crédito (fatura fechada a pagar vs fatura aberta do ciclo atual)
     - Patrimônio Líquido Real (Saldo em contas - Cartão)
-    - Receitas e Despesas do mês (excluindo transações ignoradas)
+    - Receitas e Despesas do mês (excluindo transações ignoradas e parcelas futuras projetadas)
     - Compromissos futuros de faturas parceladas
     - Despesas agrupadas por categoria
     - Lista de contas vinculadas
@@ -397,14 +460,18 @@ def get_dashboard_metrics(
     sanitize_financial_ledger(db)
 
     now = datetime.now(timezone.utc)
-    target_year = year if isinstance(year, int) else now.year
-    target_month = month if isinstance(month, int) else now.month
+    now_brt = now.astimezone(BRT)
+    end_of_today_utc = get_end_of_today_utc(now)
 
-    start_of_month = datetime(target_year, target_month, 1, tzinfo=timezone.utc)
-    if target_month == 12:
-        start_of_next_month = datetime(target_year + 1, 1, 1, tzinfo=timezone.utc)
-    else:
-        start_of_next_month = datetime(target_year, target_month + 1, 1, tzinfo=timezone.utc)
+    target_year = year if isinstance(year, int) else now_brt.year
+    target_month = month if isinstance(month, int) else now_brt.month
+
+    start_of_month = datetime(target_year, target_month, 1, 0, 0, 0, tzinfo=BRT).astimezone(timezone.utc)
+    next_m_year, next_m_month = _shift_year_month(target_year, target_month, 1)
+    start_of_next_month = datetime(next_m_year, next_m_month, 1, 0, 0, 0, tzinfo=BRT).astimezone(timezone.utc)
+
+    # Trava o teto de consultas do mês atual em end_of_today_utc para não somar parcelas futuras projetadas pela Pluggy
+    effective_month_end = min(start_of_next_month, end_of_today_utc)
 
     # 1. Saldos segregados por tipo de conta
     bank_balance = (
@@ -425,13 +492,13 @@ def get_dashboard_metrics(
     net_balance = bank_float - credit_float
     current_balance = bank_float + credit_float
 
-    # 2. Receitas e Despesas do mês selecionado (excluindo transferências ignoradas)
+    # 2. Receitas e Despesas do mês selecionado (excluindo transferências ignoradas e parcelas futuras)
     monthly_income = (
         db.query(func.coalesce(func.sum(Transaction.amount), 0))
         .filter(
             Transaction.type == TransactionType.CREDIT,
             Transaction.date >= start_of_month,
-            Transaction.date < start_of_next_month,
+            Transaction.date <= effective_month_end,
             Transaction.is_ignored == 0,
         )
         .scalar()
@@ -443,7 +510,7 @@ def get_dashboard_metrics(
         .filter(
             Transaction.type == TransactionType.DEBIT,
             Transaction.date >= start_of_month,
-            Transaction.date < start_of_next_month,
+            Transaction.date <= effective_month_end,
             Transaction.is_ignored == 0,
         )
         .scalar()
@@ -459,7 +526,7 @@ def get_dashboard_metrics(
         .filter(
             Transaction.type == TransactionType.DEBIT,
             Transaction.date >= start_of_month,
-            Transaction.date < start_of_next_month,
+            Transaction.date <= effective_month_end,
             Transaction.is_ignored == 0,
         )
         .group_by(func.coalesce(Transaction.category, "Outros"))
@@ -472,19 +539,19 @@ def get_dashboard_metrics(
         for row in category_rows
     ]
 
-    # 4. Faturas / Compromissos futuros (parcelas do cartão com data posterior ao mês atual)
+    # 4. Faturas / Compromissos futuros (parcelas do cartão com data posterior a hoje em BRT)
     future_rows = (
         db.query(Transaction)
         .filter(
             Transaction.type == TransactionType.DEBIT,
-            Transaction.date >= start_of_next_month,
+            Transaction.date > end_of_today_utc,
             Transaction.is_ignored == 0,
         )
         .order_by(Transaction.date.asc())
         .all()
     )
 
-    # Agrupa por mês futuro
+    # Agrupa por mês futuro (no fuso de Brasília)
     month_names = {
         1: "Janeiro", 2: "Fevereiro", 3: "Março", 4: "Abril",
         5: "Maio", 6: "Junho", 7: "Julho", 8: "Agosto",
@@ -493,13 +560,20 @@ def get_dashboard_metrics(
 
     future_by_month_dict = {}
     future_commitments_total = 0.0
+    curr_ym_brt = now_brt.strftime("%Y-%m")
 
     for f_tx in future_rows:
         amount_float = float(f_tx.amount)
         future_commitments_total += amount_float
-        m_key = f_tx.date.strftime("%Y-%m")
+        tx_dt_brt = (
+            f_tx.date.astimezone(BRT)
+            if f_tx.date.tzinfo
+            else f_tx.date.replace(tzinfo=timezone.utc).astimezone(BRT)
+        )
+        m_key = tx_dt_brt.strftime("%Y-%m")
         if m_key not in future_by_month_dict:
-            label = f"{month_names.get(f_tx.date.month, '')}/{f_tx.date.year}"
+            base_label = f"{month_names.get(tx_dt_brt.month, '')}/{tx_dt_brt.year}"
+            label = f"Próx. Ciclo ({base_label})" if m_key == curr_ym_brt else base_label
             future_by_month_dict[m_key] = {"month": m_key, "label": label, "total": 0.0, "count": 0}
         future_by_month_dict[m_key]["total"] += amount_float
         future_by_month_dict[m_key]["count"] += 1
@@ -538,59 +612,156 @@ def get_dashboard_metrics(
     user_salary = float(settings_map.get("user_salary", 0.0) or 0.0)
     card_closing_day = int(settings_map.get("card_closing_day", 2) or 2)
     card_due_day = int(settings_map.get("card_due_day", 7) or 7)
-    custom_bill_str = settings_map.get("custom_bill_amount")
-    custom_bill_amount = float(custom_bill_str) if custom_bill_str and float(custom_bill_str) > 0 else None
 
-    # Ciclo da fatura
+    # Ciclo da fatura aberta [last_closing, next_closing) e da fatura fechada anterior [prev_closing, last_closing)
     last_closing, next_closing = get_credit_cycle_dates(card_closing_day, now)
+    prev_closing = get_previous_closing_date(last_closing, card_closing_day)
+    current_cycle_key = last_closing.astimezone(BRT).strftime("%Y-%m-%d")
 
-    # Busca transações de cartão no ciclo
+    custom_bill_str = settings_map.get("custom_bill_amount")
+    custom_bill_cycle = settings_map.get("custom_bill_cycle")
+    custom_bill_amount: Optional[float] = None
+    if custom_bill_str and float(custom_bill_str) > 0:
+        # Expira automaticamente a fatura manual quando o ciclo vira
+        if custom_bill_cycle and custom_bill_cycle != current_cycle_key:
+            try:
+                db.execute(
+                    text("UPDATE app_settings SET value = '' WHERE key IN ('custom_bill_amount', 'custom_bill_cycle')")
+                )
+                db.commit()
+            except Exception:
+                db.rollback()
+            custom_bill_amount = None
+        else:
+            custom_bill_amount = float(custom_bill_str)
+
+    # Busca transações de cartão no ciclo aberto e no ciclo fechado
     credit_account_ids = [acc.id for acc in accounts_db if acc.type == "CREDIT"]
-    dynamic_bill = 0.0
+    open_bill = 0.0
+    closed_bill = 0.0
+
     if credit_account_ids:
-        # Débitos do ciclo
-        cycle_debits = (
+        open_cycle_upper = min(next_closing, end_of_today_utc)
+        # 6.1 Fatura Aberta (ciclo atual: [last_closing, min(next_closing, end_of_today_utc)))
+        open_debits = (
             db.query(func.coalesce(func.sum(Transaction.amount), 0))
             .filter(
                 Transaction.account_id.in_(credit_account_ids),
                 Transaction.type == TransactionType.DEBIT,
-                Transaction.date > last_closing,
-                Transaction.date <= next_closing,
+                Transaction.date >= last_closing,
+                Transaction.date <= open_cycle_upper,
                 Transaction.is_ignored == 0,
             )
             .scalar()
             or 0
         )
-        # Créditos/estornos do ciclo (excluindo pagamentos de fatura)
-        cycle_credits = (
+        open_credits = (
             db.query(func.coalesce(func.sum(Transaction.amount), 0))
             .filter(
                 Transaction.account_id.in_(credit_account_ids),
                 Transaction.type == TransactionType.CREDIT,
-                Transaction.date > last_closing,
-                Transaction.date <= next_closing,
+                Transaction.date >= last_closing,
+                Transaction.date <= open_cycle_upper,
                 Transaction.is_ignored == 0,
                 ~Transaction.description.ilike("%pagamento%"),
+                ~Transaction.description.ilike("%atraso%"),
+                ~Transaction.description.ilike("%dívida%"),
+                ~Transaction.description.ilike("%divida%"),
+                ~Transaction.description.ilike("%rotativo%"),
             )
             .scalar()
             or 0
         )
-        dynamic_bill = max(0.0, float(cycle_debits) - float(cycle_credits))
+        open_bill = max(0.0, float(open_debits) - float(open_credits))
 
+        # 6.2 Fatura Fechada anterior ([prev_closing, last_closing))
+        closed_debits = (
+            db.query(func.coalesce(func.sum(Transaction.amount), 0))
+            .filter(
+                Transaction.account_id.in_(credit_account_ids),
+                Transaction.type == TransactionType.DEBIT,
+                Transaction.date >= prev_closing,
+                Transaction.date < last_closing,
+                Transaction.is_ignored == 0,
+            )
+            .scalar()
+            or 0
+        )
+        closed_credits = (
+            db.query(func.coalesce(func.sum(Transaction.amount), 0))
+            .filter(
+                Transaction.account_id.in_(credit_account_ids),
+                Transaction.type == TransactionType.CREDIT,
+                Transaction.date >= prev_closing,
+                Transaction.date < last_closing,
+                Transaction.is_ignored == 0,
+                ~Transaction.description.ilike("%pagamento%"),
+                ~Transaction.description.ilike("%atraso%"),
+                ~Transaction.description.ilike("%dívida%"),
+                ~Transaction.description.ilike("%divida%"),
+                ~Transaction.description.ilike("%rotativo%"),
+            )
+            .scalar()
+            or 0
+        )
+        raw_closed_bill = max(0.0, float(closed_debits) - float(closed_credits))
+
+        # Se houver fatura fechada nativa sincronizada da Pluggy (/bills) para o fechamento atual, prioriza o total oficial
+        try:
+            window_start = last_closing - timedelta(days=5)
+            window_end = last_closing + timedelta(days=5)
+            native_closed = (
+                db.query(CreditCardBill)
+                .filter(
+                    CreditCardBill.account_id.in_(credit_account_ids),
+                    CreditCardBill.close_date >= window_start,
+                    CreditCardBill.close_date <= window_end,
+                )
+                .order_by(CreditCardBill.close_date.desc())
+                .first()
+            )
+            if native_closed and float(native_closed.total_amount or 0) > 0:
+                raw_closed_bill = float(native_closed.total_amount)
+        except Exception:
+            pass
+
+        # Verifica pagamentos de fatura realizados no cartão desde o fechamento (last_closing)
+        payments_since_closing = (
+            db.query(func.coalesce(func.sum(Transaction.amount), 0))
+            .filter(
+                Transaction.account_id.in_(credit_account_ids),
+                Transaction.type == TransactionType.CREDIT,
+                Transaction.date >= last_closing,
+                or_(
+                    Transaction.category == "Pagamento de Fatura",
+                    Transaction.description.ilike("%pagamento recebido%"),
+                    Transaction.description.ilike("%pagamento de fatura%"),
+                    Transaction.description.ilike("%pgto fatura%"),
+                ),
+            )
+            .scalar()
+            or 0
+        )
+        closed_bill = max(0.0, raw_closed_bill - float(payments_since_closing))
+
+    # Define qual fatura é o compromisso ativo do mês:
+    # Se há fatura fechada ainda não paga (ex: entre o fechamento dia 2 e o pagamento no vencimento dia 7),
+    # ela é a fatura prioritária a pagar. Assim que é paga, a fatura ativa passa a ser a aberta.
+    active_bill_type = "OPEN"
     if custom_bill_amount is not None:
         current_bill = custom_bill_amount
         is_bill_custom = True
     else:
-        if dynamic_bill > 0:
-            current_bill = dynamic_bill
-        elif credit_float > 0:
-            current_bill = credit_float
-        else:
-            current_bill = 0.0
         is_bill_custom = False
+        if closed_bill > 0.01:
+            current_bill = closed_bill
+            active_bill_type = "CLOSED"
+        else:
+            current_bill = open_bill
+            active_bill_type = "OPEN"
 
     # 7. Contas Fixas / Recorrentes
-    curr_ym = now.strftime("%Y-%m")
+    curr_ym = now_brt.strftime("%Y-%m")
     active_recurring = (
         db.query(RecurringBill).filter(RecurringBill.is_active == 1).all()
     )
@@ -625,7 +796,7 @@ def get_dashboard_metrics(
     else:
         commitment_pct = 100.0
 
-    days_remaining = max(1, (next_closing.date() - now.date()).days)
+    days_remaining = max(1, (next_closing.astimezone(BRT).date() - now_brt.date()).days)
     daily_budget = max(0.0, free_balance / float(days_remaining))
 
     if free_balance <= 0:
@@ -640,6 +811,9 @@ def get_dashboard_metrics(
         bank_balance=round(bank_float, 2),
         credit_balance=round(credit_float, 2),
         current_bill=round(current_bill, 2),
+        closed_bill=round(closed_bill, 2),
+        open_bill=round(open_bill, 2),
+        active_bill_type=active_bill_type,
         recurring_bills_total=round(rec_total, 2),
         recurring_bills_pending=round(rec_pending, 2),
         caixinhas_liquid_total=round(caixinhas_liquid_float, 2),
@@ -647,8 +821,8 @@ def get_dashboard_metrics(
         is_bill_custom=is_bill_custom,
         bill_closing_day=card_closing_day,
         bill_due_day=card_due_day,
-        bill_cycle_start=last_closing.strftime("%d/%m"),
-        bill_cycle_end=next_closing.strftime("%d/%m"),
+        bill_cycle_start=last_closing.astimezone(BRT).strftime("%d/%m"),
+        bill_cycle_end=next_closing.astimezone(BRT).strftime("%d/%m"),
         total_available=round(total_available, 2),
         free_balance=round(free_balance, 2),
         days_remaining=days_remaining,
@@ -704,8 +878,18 @@ def get_card_settings(db: Session = Depends(get_db)):
 
     closing_day = int(settings_map.get("card_closing_day", 2) or 2)
     due_day = int(settings_map.get("card_due_day", 7) or 7)
+    last_closing, _ = get_credit_cycle_dates(closing_day)
+    current_cycle_key = last_closing.astimezone(BRT).strftime("%Y-%m-%d")
+
     custom_bill_str = settings_map.get("custom_bill_amount")
-    custom_bill = float(custom_bill_str) if custom_bill_str and float(custom_bill_str) > 0 else None
+    custom_bill_cycle = settings_map.get("custom_bill_cycle")
+    custom_bill = (
+        float(custom_bill_str)
+        if custom_bill_str
+        and float(custom_bill_str) > 0
+        and (not custom_bill_cycle or custom_bill_cycle == current_cycle_key)
+        else None
+    )
 
     return CardSettings(
         closing_day=closing_day,
@@ -727,6 +911,12 @@ def update_card_settings(payload: CardSettingsUpdateRequest, db: Session = Depen
                 ),
                 {"val": str(c_day)},
             )
+            db.execute(
+                text(
+                    "INSERT INTO app_settings (key, value) VALUES ('card_dates_customized', '1') "
+                    "ON CONFLICT(key) DO UPDATE SET value = '1'"
+                )
+            )
         if payload.due_day is not None:
             d_day = max(1, min(31, payload.due_day))
             db.execute(
@@ -736,10 +926,31 @@ def update_card_settings(payload: CardSettingsUpdateRequest, db: Session = Depen
                 ),
                 {"val": str(d_day)},
             )
+            db.execute(
+                text(
+                    "INSERT INTO app_settings (key, value) VALUES ('card_dates_customized', '1') "
+                    "ON CONFLICT(key) DO UPDATE SET value = '1'"
+                )
+            )
+
+        # Descobre o ciclo atual para vincular a fatura manual (expira quando o ciclo virar)
+        row_c = db.execute(
+            text("SELECT value FROM app_settings WHERE key = 'card_closing_day'")
+        ).fetchone()
+        eff_closing_day = int(row_c[0]) if row_c and row_c[0] else 2
+        last_closing, _ = get_credit_cycle_dates(eff_closing_day)
+        current_cycle_key = last_closing.astimezone(BRT).strftime("%Y-%m-%d")
+
         if payload.use_auto_bill:
             db.execute(
                 text(
                     "INSERT INTO app_settings (key, value) VALUES ('custom_bill_amount', '') "
+                    "ON CONFLICT(key) DO UPDATE SET value = ''"
+                )
+            )
+            db.execute(
+                text(
+                    "INSERT INTO app_settings (key, value) VALUES ('custom_bill_cycle', '') "
                     "ON CONFLICT(key) DO UPDATE SET value = ''"
                 )
             )
@@ -751,6 +962,13 @@ def update_card_settings(payload: CardSettingsUpdateRequest, db: Session = Depen
                     "ON CONFLICT(key) DO UPDATE SET value = :val"
                 ),
                 {"val": str(c_amount)},
+            )
+            db.execute(
+                text(
+                    "INSERT INTO app_settings (key, value) VALUES ('custom_bill_cycle', :val) "
+                    "ON CONFLICT(key) DO UPDATE SET value = :val"
+                ),
+                {"val": current_cycle_key},
             )
         db.commit()
     except Exception as e:

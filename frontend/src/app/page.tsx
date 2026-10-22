@@ -85,6 +85,9 @@ interface SalaryProjection {
   bank_balance: number;
   credit_balance: number;
   current_bill: number;
+  closed_bill?: number;
+  open_bill?: number;
+  active_bill_type?: "CLOSED" | "OPEN" | string;
   recurring_bills_total: number;
   recurring_bills_pending: number;
   caixinhas_liquid_total: number;
@@ -167,6 +170,9 @@ interface TransactionItem {
   category?: string | null;
   type: "DEBIT" | "CREDIT";
   pluggy_transaction_id: string;
+  pluggy_bill_id?: string | null;
+  installment_number?: number | null;
+  total_installments?: number | null;
   is_ignored?: boolean;
 }
 
@@ -1584,14 +1590,30 @@ export default function DashboardPage() {
                           <CreditCard className="h-4 w-4" />
                         </div>
                         <div>
-                          <p className="text-xs font-semibold text-slate-800">
-                            Fatura do cartão
-                          </p>
-                          <p className="text-[11px] text-slate-400 flex items-center gap-1.5">
+                          <div className="flex items-center gap-1.5">
+                            <p className="text-xs font-semibold text-slate-800">
+                              {proj.active_bill_type === "CLOSED"
+                                ? "Fatura fechada (a pagar)"
+                                : "Fatura do cartão"}
+                            </p>
+                            {proj.active_bill_type === "CLOSED" && (
+                              <span className="px-1.5 py-0.5 text-[10px] font-bold rounded bg-amber-100 text-amber-800">
+                                Vence dia {String(proj.bill_due_day).padStart(2, "0")}
+                              </span>
+                            )}
+                          </div>
+                          <p className="text-[11px] text-slate-400 flex items-center gap-1.5 flex-wrap">
                             <span>
                               {creditAccountName}{" "}
-                              {proj.is_bill_custom ? "(Manual)" : "(Automático)"}
+                              {proj.is_bill_custom
+                                ? "(Manual)"
+                                : `(${proj.bill_cycle_start} a ${proj.bill_cycle_end})`}
                             </span>
+                            {proj.active_bill_type === "CLOSED" && (proj.open_bill ?? 0) > 0 && (
+                              <span className="text-slate-400">
+                                • Próx. aberta: {formatCurrency(proj.open_bill ?? 0)}
+                              </span>
+                            )}
                             <button
                               onClick={() => setIsCardModalOpen(true)}
                               className="text-slate-400 hover:text-slate-700 underline decoration-dotted"
@@ -2359,10 +2381,16 @@ export default function DashboardPage() {
                       className={`text-[10px] font-semibold px-2 py-0.5 rounded-full ${
                         selectedAccountId === creditAccount?.id && period === "current_month"
                           ? "bg-white/20 text-white"
+                          : proj?.active_bill_type === "CLOSED"
+                          ? "bg-amber-100 text-amber-800"
                           : "bg-slate-100 text-slate-600"
                       }`}
                     >
-                      {proj?.is_bill_custom ? "Manual" : "Ciclo atual"}
+                      {proj?.is_bill_custom
+                        ? "Manual"
+                        : proj?.active_bill_type === "CLOSED"
+                        ? "Fechada a pagar"
+                        : `${proj?.bill_cycle_start ?? ""} a ${proj?.bill_cycle_end ?? ""}`}
                     </span>
                     <button
                       onClick={(e) => {
@@ -2389,7 +2417,9 @@ export default function DashboardPage() {
                         : "text-slate-500"
                     }`}
                   >
-                    Fatura Aberta ({creditAccountName})
+                    {proj?.active_bill_type === "CLOSED"
+                      ? `Fatura Fechada (${creditAccountName})`
+                      : `Fatura Aberta (${creditAccountName})`}
                   </p>
                   <p
                     className={`text-xl font-black tracking-tight tabular-nums mt-0.5 ${
@@ -2409,7 +2439,11 @@ export default function DashboardPage() {
                       : "border-slate-100 text-slate-400"
                   }`}
                 >
-                  <span>Fecha dia {proj?.bill_closing_day ?? 2} • Vence dia {proj?.bill_due_day ?? 7}</span>
+                  <span>
+                    {proj?.active_bill_type === "CLOSED" && (proj?.open_bill ?? 0) > 0
+                      ? `Aberta atual: ${formatCurrency(proj?.open_bill ?? 0)}`
+                      : `Fecha dia ${proj?.bill_closing_day ?? 2} • Vence dia ${proj?.bill_due_day ?? 7}`}
+                  </span>
                   <span className="font-semibold text-indigo-500 group-hover:translate-x-0.5 transition">
                     {selectedAccountId === creditAccount?.id && period === "current_month" ? "Filtrado ✓" : "Filtrar cartão →"}
                   </span>
@@ -2855,14 +2889,21 @@ export default function DashboardPage() {
 
                             {/* Detalhes / Parcela */}
                             <td className="py-4 px-4">
-                              {isFuture ? (
-                                <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-semibold bg-amber-50 text-amber-700 border border-amber-200/70">
-                                  <Clock className="h-3 w-3" />
-                                  <span>Parcela futura</span>
-                                </span>
-                              ) : (
-                                <span className="text-slate-300">—</span>
-                              )}
+                              <div className="flex items-center gap-1.5 flex-wrap">
+                                {tx.installment_number && tx.total_installments && (
+                                  <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-200/70">
+                                    Parcela {tx.installment_number}/{tx.total_installments}
+                                  </span>
+                                )}
+                                {isFuture ? (
+                                  <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-semibold bg-amber-50 text-amber-700 border border-amber-200/70">
+                                    <Clock className="h-3 w-3" />
+                                    <span>Parcela futura</span>
+                                  </span>
+                                ) : !tx.installment_number ? (
+                                  <span className="text-slate-300">—</span>
+                                ) : null}
+                              </div>
                             </td>
 
                             {/* Switch iOS: Ignorar no Raio-X */}

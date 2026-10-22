@@ -1,16 +1,17 @@
 import os
 import logging
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
 import requests
 from dotenv import load_dotenv
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-from app.models import Account, Transaction, TransactionType
+from app.models import Account, CreditCardBill, Transaction, TransactionType
 
 logger = logging.getLogger(__name__)
 ROOT_ENV = Path(__file__).resolve().parents[3] / ".env"
@@ -217,6 +218,45 @@ class PluggyClient:
 
         return all_transactions
 
+    def fetch_bills(self, pluggy_account_id: str) -> List[Dict[str, Any]]:
+        """
+        Busca as faturas consolidadas do cartão de crédito na Pluggy:
+        GET https://api.pluggy.ai/bills?accountId={pluggy_account_id}
+        Retorna lista vazia caso o conector não disponibilize o endpoint.
+        """
+        try:
+            resp = requests.get(
+                f"{self.BASE_URL}/bills",
+                headers=self.headers,
+                params={"accountId": pluggy_account_id},
+                timeout=20,
+            )
+            if resp.status_code != 200:
+                logger.warning(
+                    "Pluggy /bills retornou status %s para a conta %s",
+                    resp.status_code,
+                    pluggy_account_id,
+                )
+                return []
+            payload = resp.json()
+            return payload.get("results", []) or []
+        except Exception as exc:
+            logger.warning(
+                "Não foi possível buscar /bills para a conta %s: %s",
+                pluggy_account_id,
+                exc,
+            )
+            return []
+
+    @staticmethod
+    def _parse_iso_dt(raw_str: Optional[str]) -> Optional[datetime]:
+        if not raw_str or not isinstance(raw_str, str):
+            return None
+        try:
+            return datetime.fromisoformat(raw_str.replace("Z", "+00:00"))
+        except Exception:
+            return None
+
     @staticmethod
     def _parse_transaction_json(
         raw_tx: Dict[str, Any], local_account_id: int
@@ -227,6 +267,7 @@ class PluggyClient:
         - merchant_cnpj (merchant.cnpj)
         - category (category)
         - type (DEBIT / CREDIT)
+        - creditCardMetadata (billId, installmentNumber, totalInstallments)
         """
         merchant = raw_tx.get("merchant") or {}
         merchant_name = (
@@ -252,6 +293,25 @@ class PluggyClient:
             else datetime.now(timezone.utc)
         )
 
+        cc_meta = raw_tx.get("creditCardMetadata") or {}
+        pluggy_bill_id = cc_meta.get("billId")
+        if pluggy_bill_id is not None:
+            pluggy_bill_id = str(pluggy_bill_id)
+
+        installment_number = cc_meta.get("installmentNumber")
+        if installment_number is not None:
+            try:
+                installment_number = int(installment_number)
+            except (ValueError, TypeError):
+                installment_number = None
+
+        total_installments = cc_meta.get("totalInstallments")
+        if total_installments is not None:
+            try:
+                total_installments = int(total_installments)
+            except (ValueError, TypeError):
+                total_installments = None
+
         return {
             "account_id": local_account_id,
             "amount": raw_amount,
@@ -262,6 +322,9 @@ class PluggyClient:
             "category": category,
             "type": tx_type,
             "pluggy_transaction_id": str(raw_tx["id"]),
+            "pluggy_bill_id": pluggy_bill_id,
+            "installment_number": installment_number,
+            "total_installments": total_installments,
         }
 
     def sync_to_database(
@@ -272,23 +335,31 @@ class PluggyClient:
         """
         Orquestra a sincronização completa:
         1. Autentica na Pluggy via CLIENT_ID e CLIENT_SECRET
-        2. Faz upsert das contas vinculadas ao PLUGGY_ITEM_ID
-        3. Busca as transações em /v2/transactions e faz upsert usando pluggy_transaction_id
+        2. Faz upsert das contas vinculadas ao PLUGGY_ITEM_ID (incluindo creditData)
+        3. Faz upsert das faturas de cartão em /bills (quando aplicável)
+        4. Busca as transações em /v2/transactions e faz upsert usando pluggy_transaction_id
         """
         self.authenticate()
         raw_accounts = self.fetch_accounts()
 
         accounts_synced = 0
         transactions_upserted = 0
+        brt = timezone(timedelta(hours=-3))
 
         for raw_acc in raw_accounts:
             pluggy_acc_id = str(raw_acc["id"])
+            credit_data = raw_acc.get("creditData") or {}
+            close_dt = self._parse_iso_dt(credit_data.get("balanceCloseDate"))
+            due_dt = self._parse_iso_dt(credit_data.get("balanceDueDate"))
+
             acc_values = {
                 "name": raw_acc.get("name") or "Conta Pluggy",
                 "type": raw_acc.get("type") or "BANK",
                 "balance": Decimal(str(raw_acc.get("balance", 0.0))),
                 "currency": raw_acc.get("currencyCode") or "BRL",
                 "pluggy_account_id": pluggy_acc_id,
+                "balance_close_date": close_dt,
+                "balance_due_date": due_dt,
             }
 
             acc_stmt = (
@@ -301,12 +372,82 @@ class PluggyClient:
                         "type": acc_values["type"],
                         "balance": acc_values["balance"],
                         "currency": acc_values["currency"],
+                        "balance_close_date": acc_values["balance_close_date"],
+                        "balance_due_date": acc_values["balance_due_date"],
                     },
                 )
                 .returning(Account.id)
             )
             local_account_id = db.execute(acc_stmt).scalar_one()
             accounts_synced += 1
+
+            # Se a conta for de crédito e trouxer datas reais do banco, preenche os dias padrão
+            # caso o usuário ainda não tenha customizado manualmente
+            if acc_values["type"] == "CREDIT" and (close_dt or due_dt):
+                try:
+                    cust_row = db.execute(
+                        text("SELECT value FROM app_settings WHERE key = 'card_dates_customized'")
+                    ).fetchone()
+                    is_customized = cust_row and cust_row[0] == "1"
+                    if not is_customized:
+                        if close_dt:
+                            close_day_brt = close_dt.astimezone(brt).day
+                            db.execute(
+                                text(
+                                    "INSERT INTO app_settings (key, value) VALUES ('card_closing_day', :val) "
+                                    "ON CONFLICT(key) DO UPDATE SET value = :val"
+                                ),
+                                {"val": str(close_day_brt)},
+                            )
+                        if due_dt:
+                            due_day_brt = due_dt.astimezone(brt).day
+                            db.execute(
+                                text(
+                                    "INSERT INTO app_settings (key, value) VALUES ('card_due_day', :val) "
+                                    "ON CONFLICT(key) DO UPDATE SET value = :val"
+                                ),
+                                {"val": str(due_day_brt)},
+                            )
+                except Exception:
+                    pass
+
+            # Sincroniza faturas nativas da Pluggy (/bills) para contas de crédito
+            if acc_values["type"] == "CREDIT":
+                raw_bills = self.fetch_bills(pluggy_acc_id)
+                for raw_bill in raw_bills:
+                    bill_id = raw_bill.get("id")
+                    if not bill_id:
+                        continue
+                    bill_values = {
+                        "account_id": local_account_id,
+                        "pluggy_bill_id": str(bill_id),
+                        "due_date": self._parse_iso_dt(raw_bill.get("dueDate")),
+                        "close_date": self._parse_iso_dt(
+                            raw_bill.get("closeDate") or raw_bill.get("closingDate")
+                        ),
+                        "total_amount": Decimal(str(raw_bill.get("totalAmount", 0.0) or 0.0)),
+                        "minimum_payment_amount": (
+                            Decimal(str(raw_bill["minimumPaymentAmount"]))
+                            if raw_bill.get("minimumPaymentAmount") is not None
+                            else None
+                        ),
+                        "state": raw_bill.get("state"),
+                    }
+                    bill_stmt = (
+                        dialect_insert(db, CreditCardBill)
+                        .values(**bill_values)
+                        .on_conflict_do_update(
+                            index_elements=[CreditCardBill.pluggy_bill_id],
+                            set_={
+                                "due_date": bill_values["due_date"],
+                                "close_date": bill_values["close_date"],
+                                "total_amount": bill_values["total_amount"],
+                                "minimum_payment_amount": bill_values["minimum_payment_amount"],
+                                "state": bill_values["state"],
+                            },
+                        )
+                    )
+                    db.execute(bill_stmt)
 
             raw_transactions = self.fetch_transactions(
                 pluggy_account_id=pluggy_acc_id, date_from=date_from
@@ -328,6 +469,9 @@ class PluggyClient:
                             "merchant_cnpj": tx_values["merchant_cnpj"],
                             "category": tx_values["category"],
                             "type": tx_values["type"],
+                            "pluggy_bill_id": tx_values["pluggy_bill_id"],
+                            "installment_number": tx_values["installment_number"],
+                            "total_installments": tx_values["total_installments"],
                         },
                     )
                 )
