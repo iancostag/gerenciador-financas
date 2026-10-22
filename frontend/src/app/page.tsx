@@ -97,6 +97,11 @@ interface SalaryProjection {
   bill_due_day: number;
   bill_cycle_start: string;
   bill_cycle_end: string;
+  bill_status?: "CLOSED" | "OPEN" | string;
+  bill_source?: "PLUGGY" | "CALCULATED" | string;
+  bill_due_date?: string;
+  bill_closed_amount?: number;
+  bill_open_amount?: number;
   total_available: number;
   free_balance: number;
   days_remaining?: number;
@@ -1721,10 +1726,16 @@ export default function DashboardPage() {
                     <div className="flex items-center gap-3.5">
                       <div className="h-11 w-11 rounded-xl bg-amber-50 border border-amber-200/70 flex flex-col items-center justify-center shrink-0">
                         <span className="text-xs font-extrabold text-amber-800 leading-none">
-                          {String(proj.bill_due_day).padStart(2, "0")}
+                          {proj.bill_due_date
+                            ? proj.bill_due_date.slice(0, 2)
+                            : String(proj.bill_due_day).padStart(2, "0")}
                         </span>
                         <span className="text-[9px] font-bold uppercase text-amber-600 mt-0.5">
-                          {currentMonthShort}
+                          {proj.bill_due_date
+                            ? new Date(2000, Number(proj.bill_due_date.slice(3, 5)) - 1, 1)
+                                .toLocaleDateString("pt-BR", { month: "short" })
+                                .replace(".", "")
+                            : currentMonthShort}
                         </span>
                       </div>
                       <div>
@@ -1732,8 +1743,8 @@ export default function DashboardPage() {
                           Fatura Cartão {creditAccountName}
                         </p>
                         <p className="text-[11px] text-slate-400 mt-0.5">
-                          Cartão de crédito • Fecha dia{" "}
-                          {String(proj.bill_closing_day).padStart(2, "0")}
+                          {proj.bill_status === "CLOSED" ? "Fatura fechada" : "Fatura aberta"} • Compras de {proj.bill_cycle_start} a {proj.bill_cycle_end}
+                          {proj.bill_source === "PLUGGY" && " • Fatura oficial"}
                         </p>
                       </div>
                     </div>
