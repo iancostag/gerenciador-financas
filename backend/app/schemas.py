@@ -74,6 +74,7 @@ class SalaryProjection(BaseModel):
     active_bill_type: str = "OPEN"  # "CLOSED", "OPEN", "CUSTOM"
     recurring_bills_total: float = 0.0
     recurring_bills_pending: float = 0.0
+    recurring_bills_cycle: float = 0.0
     caixinhas_liquid_total: float = 0.0
     caixinhas_total: float = 0.0
     is_bill_custom: bool = False

@@ -717,6 +717,21 @@ def get_dashboard_metrics(
     )
     rec_pending = max(0.0, rec_total - rec_paid)
 
+    # Contas fixas do ciclo da fatura (para a Projeção):
+    # Se a fatura ativa vence no próximo mês (ex: 2026-11), provisiona as contas fixas do ciclo da fatura.
+    cycle_forecast = (
+        bill.open_due_date.strftime("%Y-%m")
+        if bill.open_due_date
+        else curr_ym
+    )
+    if cycle_forecast != curr_ym:
+        rec_paid_cycle = sum(
+            float(b.amount) for b in active_recurring if b.last_paid_month == cycle_forecast
+        )
+        rec_cycle_pending = max(0.0, rec_total - rec_paid_cycle)
+    else:
+        rec_cycle_pending = rec_pending
+
     # 7.1 Caixinhas (Mercado Pago / Reservas)
     caixinhas_liquid_total = (
         db.query(func.coalesce(func.sum(Caixinha.balance), 0))
@@ -732,7 +747,7 @@ def get_dashboard_metrics(
     caixinhas_liquid_float = float(caixinhas_liquid_total)
     caixinhas_total_float = float(caixinhas_total)
 
-    total_commitments = current_bill + rec_pending
+    total_commitments = current_bill + rec_cycle_pending
     total_available = user_salary + bank_float + caixinhas_liquid_float
     free_balance = total_available - total_commitments
     if total_available > 0:
@@ -762,6 +777,7 @@ def get_dashboard_metrics(
         active_bill_type=bill.status,
         recurring_bills_total=round(rec_total, 2),
         recurring_bills_pending=round(rec_pending, 2),
+        recurring_bills_cycle=round(rec_cycle_pending, 2),
         caixinhas_liquid_total=round(caixinhas_liquid_float, 2),
         caixinhas_total=round(caixinhas_total_float, 2),
         is_bill_custom=is_bill_custom,

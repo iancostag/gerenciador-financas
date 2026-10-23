@@ -90,6 +90,7 @@ interface SalaryProjection {
   active_bill_type?: "CLOSED" | "OPEN" | string;
   recurring_bills_total: number;
   recurring_bills_pending: number;
+  recurring_bills_cycle?: number;
   caixinhas_liquid_total: number;
   caixinhas_total: number;
   is_bill_custom: boolean;
@@ -331,7 +332,9 @@ export default function DashboardPage() {
   const [isCreatingCaixinha, setIsCreatingCaixinha] = useState<boolean>(false);
 
   // Modo de visualização do Raio-X: "cash" (Caixa Hoje) ou "projection" (Projeção + Salário)
-  const [balanceViewMode, setBalanceViewMode] = useState<"cash" | "projection">("cash");
+  const [balanceViewMode, setBalanceViewMode] = useState<"cash" | "projection">("projection");
+  // Toggle para incluir ou desconsiderar contas fixas na Projeção
+  const [includeFixedInProjection, setIncludeFixedInProjection] = useState<boolean>(true);
 
   // Configuração do Salário
   const [isEditingSalary, setIsEditingSalary] = useState<boolean>(false);
@@ -918,11 +921,11 @@ export default function DashboardPage() {
 
   // 1. Valores de Caixa Imediato (Hoje no Bolso - sem contar salário que ainda não caiu)
   const immediateAvailable = (proj?.bank_balance ?? 0) + (proj?.caixinhas_liquid_total ?? 0);
-  const totalCommitments = (proj?.current_bill ?? 0) + (proj?.recurring_bills_pending ?? 0);
-  const immediateCashBalance = immediateAvailable - totalCommitments;
+  const immediateCommitments = (proj?.current_bill ?? 0) + (proj?.recurring_bills_pending ?? 0);
+  const immediateCashBalance = immediateAvailable - immediateCommitments;
   const immediateCommitmentPct =
     immediateAvailable > 0
-      ? Math.min(100, Math.max(0, (totalCommitments / immediateAvailable) * 100))
+      ? Math.min(100, Math.max(0, (immediateCommitments / immediateAvailable) * 100))
       : 100;
   const immediateDailyBudget =
     immediateCashBalance > 0 && (proj?.days_remaining ?? 30) > 0
@@ -930,10 +933,19 @@ export default function DashboardPage() {
       : 0;
 
   // 2. Valores de Projeção com Salário Previsto (Fim do Ciclo)
-  const projectedBalance = proj?.free_balance ?? 0;
+  const cycleRecurring = proj?.recurring_bills_cycle ?? proj?.recurring_bills_total ?? 0;
+  const activeProjectedRecurring = includeFixedInProjection ? cycleRecurring : 0;
   const projectedAvailable = proj?.total_available ?? 0;
-  const projectedCommitmentPct = Math.min(100, Math.max(0, proj?.commitment_percentage ?? 0));
-  const projectedDailyBudget = proj?.daily_budget ?? 0;
+  const projectedCommitments = (proj?.current_bill ?? 0) + activeProjectedRecurring;
+  const projectedBalance = projectedAvailable - projectedCommitments;
+  const projectedCommitmentPct =
+    projectedAvailable > 0
+      ? Math.min(100, Math.max(0, (projectedCommitments / projectedAvailable) * 100))
+      : 100;
+  const projectedDailyBudget =
+    projectedBalance > 0 && (proj?.days_remaining ?? 30) > 0
+      ? projectedBalance / (proj?.days_remaining ?? 30)
+      : 0;
 
   // 3. Valores Ativos de acordo com o Toggle ("cash" vs "projection")
   const isCashMode = balanceViewMode === "cash";
@@ -942,6 +954,9 @@ export default function DashboardPage() {
   const activeCommitmentPct = isCashMode ? immediateCommitmentPct : projectedCommitmentPct;
   const activeFreePct = Math.max(0, Number((100 - activeCommitmentPct).toFixed(1)));
   const activeDailyBudget = isCashMode ? immediateDailyBudget : projectedDailyBudget;
+  const activeFixedBills = isCashMode
+    ? (proj?.recurring_bills_pending ?? 0)
+    : activeProjectedRecurring;
 
   const freeBalance = activeFreeBalance;
   const freeParts = splitCurrencyParts(freeBalance);
@@ -1311,38 +1326,70 @@ export default function DashboardPage() {
                       </span>
                     </div>
 
-                    {/* Toggle Switch Entre os Dois Modos */}
-                    <div className="inline-flex items-center p-1 bg-white/90 backdrop-blur-xs rounded-xl border border-slate-200/90 shadow-2xs self-start sm:self-auto gap-0.5">
-                      <button
-                        type="button"
-                        onClick={() => setBalanceViewMode("cash")}
-                        className={`px-3 py-1 text-xs font-bold rounded-lg transition-all ${
-                          isCashMode
-                            ? "bg-slate-900 text-white shadow-2xs"
-                            : "text-slate-500 hover:text-slate-900"
-                        }`}
-                        title="Ver saldo real que você tem hoje no banco menos a fatura"
-                      >
-                        Caixa Hoje
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setBalanceViewMode("projection")}
-                        className={`px-3 py-1 text-xs font-bold rounded-lg transition-all ${
-                          !isCashMode
-                            ? "bg-slate-900 text-white shadow-2xs"
-                            : "text-slate-500 hover:text-slate-900"
-                        }`}
-                        title="Ver projeção considerando a entrada do próximo salário"
-                      >
-                        Projeção + Salário
-                      </button>
+                    {/* Controles de visualização: Segmented Control + Botão de Contas Fixas */}
+                    <div className="flex items-center gap-2 flex-wrap self-start sm:self-auto">
+                      <div className="inline-flex items-center p-1 bg-white/90 backdrop-blur-xs rounded-xl border border-slate-200/90 shadow-2xs gap-0.5">
+                        <button
+                          type="button"
+                          onClick={() => setBalanceViewMode("cash")}
+                          className={`px-3 py-1 text-xs font-bold rounded-lg transition-all ${
+                            isCashMode
+                              ? "bg-slate-900 text-white shadow-2xs"
+                              : "text-slate-500 hover:text-slate-900"
+                          }`}
+                          title="Ver saldo real que você tem hoje no banco menos a fatura"
+                        >
+                          Caixa Hoje
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setBalanceViewMode("projection")}
+                          className={`px-3 py-1 text-xs font-bold rounded-lg transition-all ${
+                            !isCashMode
+                              ? "bg-slate-900 text-white shadow-2xs"
+                              : "text-slate-500 hover:text-slate-900"
+                          }`}
+                          title="Ver projeção considerando a entrada do próximo salário"
+                        >
+                          Projeção + Salário
+                        </button>
+                      </div>
+
+                      {/* Botão toggle: Com / Sem Contas Fixas (ativo quando na Projeção) */}
+                      {!isCashMode && (
+                        <button
+                          type="button"
+                          onClick={() => setIncludeFixedInProjection(!includeFixedInProjection)}
+                          className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl text-xs font-semibold border transition shadow-2xs ${
+                            includeFixedInProjection
+                              ? "bg-slate-900 text-white border-slate-900"
+                              : "bg-white text-slate-600 border-slate-200/90 hover:bg-slate-50"
+                          }`}
+                          title="Clique para alternar dedução de contas fixas na projeção"
+                        >
+                          <span
+                            className={`h-2 w-2 rounded-full transition ${
+                              includeFixedInProjection ? "bg-emerald-400" : "bg-slate-300"
+                            }`}
+                          />
+                          <span>{includeFixedInProjection ? "Com fixas" : "Sem fixas"}</span>
+                          <span
+                            className={`text-[10px] font-mono px-1 py-0.5 rounded ${
+                              includeFixedInProjection
+                                ? "bg-white/20 text-white"
+                                : "bg-slate-100 text-slate-500"
+                            }`}
+                          >
+                            {includeFixedInProjection ? `-${formatCurrency(cycleRecurring)}` : "R$ 0"}
+                          </span>
+                        </button>
+                      )}
                     </div>
                   </div>
 
                   {/* Valor Principal Gigante com Centavos Menores */}
                   <div>
-                    <div className="flex items-center gap-2 mb-1.5">
+                    <div className="flex items-center gap-2 mb-1.5 flex-wrap">
                       <span
                         className={`px-2.5 py-0.5 rounded-full text-[11px] font-semibold border ${
                           freeBalance < 0
@@ -1354,7 +1401,9 @@ export default function DashboardPage() {
                           ? freeBalance < 0
                             ? "Déficit atual no banco"
                             : "Caixa positivo hoje"
-                          : "Previsão com salário previsto"}
+                          : includeFixedInProjection
+                          ? "Previsão com salário + contas fixas"
+                          : "Previsão sem deduzir contas fixas"}
                       </span>
                     </div>
 
@@ -1382,7 +1431,9 @@ export default function DashboardPage() {
                         ? freeBalance < 0
                           ? `Se você fosse quitar sua fatura e contas hoje, faltariam ${formatCurrency(Math.abs(freeBalance))} no banco (sem contar salário futuro).`
                           : "É o que você tem sobrando no bolso hoje após reservar o valor da fatura e contas pendentes."
-                        : "É o que sobra no planejamento após a entrada do salário previsto e reserva das faturas e contas fixas."}
+                        : includeFixedInProjection
+                        ? "É o que sobra após reservar a fatura do cartão e todas as contas fixas do próximo ciclo."
+                        : "É o que sobra no planejamento considerando apenas a fatura do cartão (sem descontar contas fixas)."}
                     </p>
                   </div>
 
@@ -1444,7 +1495,7 @@ export default function DashboardPage() {
                           <strong className="font-semibold text-slate-900">
                             Atenção ao fluxo de caixa imediato.
                           </strong>{" "}
-                          Seu saldo em conta + caixinhas ({formatCurrency(immediateAvailable)}) não cobre o total de compromissos ({formatCurrency(totalCommitments)}). Alterne para <strong>Projeção + Salário</strong> para ver o cenário após a entrada da renda.
+                          Seu saldo em conta + caixinhas ({formatCurrency(immediateAvailable)}) não cobre o total de compromissos ({formatCurrency(immediateCommitments)}). Alterne para <strong>Projeção + Salário</strong> para ver o cenário após a entrada da renda.
                         </>
                       ) : (
                         <>
@@ -1641,21 +1692,47 @@ export default function DashboardPage() {
                           <Home className="h-4 w-4" />
                         </div>
                         <div>
-                          <p className="text-xs font-semibold text-slate-800">
-                            Contas fixas pendentes
-                          </p>
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <p className="text-xs font-semibold text-slate-800">
+                              {isCashMode ? "Contas fixas pendentes" : "Contas fixas previstas"}
+                            </p>
+                            {!isCashMode && (
+                              <button
+                                type="button"
+                                onClick={() => setIncludeFixedInProjection(!includeFixedInProjection)}
+                                className={`text-[10px] font-bold px-1.5 py-0.5 rounded border transition inline-flex items-center gap-1 ${
+                                  includeFixedInProjection
+                                    ? "bg-emerald-50 text-emerald-700 border-emerald-200"
+                                    : "bg-slate-100 text-slate-400 border-slate-200 line-through"
+                                }`}
+                                title="Alternar dedução de contas fixas na projeção"
+                              >
+                                {includeFixedInProjection ? "✓ Ativa" : "Desativada"}
+                              </button>
+                            )}
+                          </div>
                           <button
                             onClick={() => setActiveTab("recurring")}
-                            className="text-[11px] text-slate-400 hover:text-slate-700 transition text-left"
+                            className="text-[11px] text-slate-400 hover:text-slate-700 transition text-left block"
                           >
-                            {proj.recurring_bills_pending === 0 && (proj.recurring_bills_total || 0) > 0
-                              ? "Todas as contas pagas no mês"
-                              : "Planejamento mensal • ver lista"}
+                            {isCashMode
+                              ? proj.recurring_bills_pending === 0 && (proj.recurring_bills_total || 0) > 0
+                                ? "Todas as contas pagas no mês"
+                                : "Planejamento mensal • ver lista"
+                              : includeFixedInProjection
+                              ? `Provisionadas para o ciclo (${formatCurrency(cycleRecurring)})`
+                              : "Desconsideradas na projeção"}
                           </button>
                         </div>
                       </div>
-                      <span className="text-xs font-bold text-slate-900 tabular-nums">
-                        - {formatCurrency(proj.recurring_bills_pending ?? proj.recurring_bills_total ?? 0)}
+                      <span
+                        className={`text-xs font-bold tabular-nums transition ${
+                          !isCashMode && !includeFixedInProjection
+                            ? "text-slate-400 line-through"
+                            : "text-slate-900"
+                        }`}
+                      >
+                        - {formatCurrency(activeFixedBills)}
                       </span>
                     </div>
                   </div>
